@@ -5,6 +5,7 @@ V2EX 每日自动签到脚本
 =====================
 
 原理：带 Cookie 访问 /mission/daily → 解析 once token → 请求 /mission/daily/redeem?once=xxx 完成签到。
+签到后从页面右上角余额区统计各账号铜币总余额，并在日志和 Telegram 通知中汇总。
 
 【获取 Cookie】
   未开 2FA 的账号只需 A2 一个 Cookie；开了 2FA 的账号需完整 Cookie 串（含 A2O 等）
@@ -61,10 +62,8 @@ TIMEOUT = 20
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 
-
 def log(name, msg):
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [{name}] {msg}", flush=True)
-
 
 def send_telegram(text):
     """通过 Telegram Bot 推送通知，需配置 TG_BOT_TOKEN 和 TG_CHAT_ID 环境变量"""
@@ -83,7 +82,6 @@ def send_telegram(text):
             log("TG", f"通知发送失败 HTTP {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
         log("TG", f"通知发送异常: {e}")
-
 
 def load_config():
     """加载账号配置，返回 [(name, cookie), ...]
@@ -121,7 +119,6 @@ def load_config():
             accounts.append((cfg.get("name", "account"), cfg["cookie"]))
     return accounts
 
-
 def _extract_reward(html):
     """从签到页 HTML 提取奖励信息，返回 '获得 X 铜币' 或 ''"""
     patterns = [
@@ -136,9 +133,41 @@ def _extract_reward(html):
             return f"获得 {m.group(1)} {m.group(2)}"
     return ""
 
+def _extract_balance(html):
+    """从页面右上角余额区提取账户总余额（登录后每个页面都有，无需额外请求）
+
+    HTML 形如：<a href="/balance" class="balance_area">0 <img gold> 2 <img silver> 24608 <img bronze></a>
+    返回 {"金币": 0, "银币": 2, "铜币": 24608}，解析失败返回 None
+    """
+    m = re.search(r'class="balance_area"[^>]*>(.*?)</(?:a|div)>', html, re.S)
+    if not m:
+        return None
+    area = m.group(1)
+    units = (("gold", "金币"), ("silver", "银币"), ("bronze", "铜币"))
+
+    # 方式1：数字紧邻对应币种图标（V2EX 现行结构：数字在 img 前）
+    res = {}
+    for icon, unit in units:
+        mm = re.search(r'(\d+)\s*<img[^>]*' + icon, area)
+        if mm:
+            res[unit] = int(mm.group(1))
+    if len(res) == 3:
+        return res
+
+    # 方式2：兜底——去掉所有标签后按顺序取数字（金、银、铜）
+    nums = re.findall(r'\d+', re.sub(r'<[^>]+>', ' ', area))
+    if len(nums) >= 3:
+        return {unit: int(n) for (_, unit), n in zip(units, nums[:3])}
+    return None
+
+def _bal_suffix(balance):
+    """日志后缀：'，铜币余额 X' 或 ''"""
+    if balance and "铜币" in balance:
+        return f"，铜币余额 {balance['铜币']}"
+    return ""
 
 def checkin(name, cookie):
-    """签到，返回 (success: bool, reward: str)"""
+    """签到，返回 (success: bool, reward: str, balance: dict|None)"""
     s = requests.Session()
     s.headers.update({
         "User-Agent": UA,
@@ -153,12 +182,16 @@ def checkin(name, cookie):
     # 未登录会重定向到 /signin，或页面提示需登录
     if "/signin" in r.url or "You need to sign in" in r.text or "请先登录" in r.text:
         log(name, "X 未登录或 Cookie 已失效")
-        return False, "未登录或 Cookie 已失效"
+        return False, "未登录或 Cookie 已失效", None
+
+    # 页面右上角余额区：金/银/铜总余额
+    balance = _extract_balance(r.text)
+
     if "每日登录奖励已领取" in r.text:
         reward = _extract_reward(r.text)
         msg = f"今日已签过（{reward}）" if reward else "今日已签过"
-        log(name, f"OK {msg}")
-        return True, msg
+        log(name, f"OK {msg}" + _bal_suffix(balance))
+        return True, msg, balance
 
     # 2. 提取 once token
     m = re.search(r'/mission/daily/redeem\?once=(\d+)', r.text)
@@ -166,7 +199,7 @@ def checkin(name, cookie):
         m = re.search(r'once=(\d+)', r.text)
     if not m:
         log(name, "X 未找到签到 token，页面结构可能已变化")
-        return False, "未找到签到 token"
+        return False, "未找到签到 token", None
     once = m.group(1)
 
     # 3. 领取奖励
@@ -174,7 +207,7 @@ def checkin(name, cookie):
                timeout=TIMEOUT, allow_redirects=True)
     if r2.status_code != 200:
         log(name, f"X 签到失败 HTTP {r2.status_code}")
-        return False, f"签到失败 HTTP {r2.status_code}"
+        return False, f"签到失败 HTTP {r2.status_code}", None
 
     # 4. 领取后从"再次请求的签到页"和 redeem 响应里提取奖励
     #    （V2EX 的"已成功领取 X 铜币"提示框只在领取瞬间显示，刷新即消失）
@@ -182,12 +215,15 @@ def checkin(name, cookie):
     r3 = s.get(f"{BASE_URL}/mission/daily", timeout=TIMEOUT, allow_redirects=True)
     pages = [r3.text if r3.status_code == 200 else "", r2.text]
 
+    # 领取后刷新余额（优先用最新页面）
+    balance = (_extract_balance(pages[0]) or _extract_balance(r2.text) or balance)
+
     # 5. 多重正则提取奖励（两个页面都试）
     for page in pages:
         reward = _extract_reward(page)
         if reward:
-            log(name, f"OK 签到成功（{reward}）")
-            return True, reward
+            log(name, f"OK 签到成功（{reward}）" + _bal_suffix(balance))
+            return True, reward, balance
 
     # 诊断：打印疑似片段，方便下次精确定位
     for page in pages:
@@ -201,9 +237,8 @@ def checkin(name, cookie):
             continue
         break
 
-    log(name, "OK 签到成功")
-    return True, "签到成功（奖励信息未识别）"
-
+    log(name, "OK 签到成功" + _bal_suffix(balance))
+    return True, "签到成功（奖励信息未识别）", balance
 
 def main():
     accounts = load_config()
@@ -213,13 +248,20 @@ def main():
     log("系统", f"开始签到，共 {len(accounts)} 个账号")
     ok = 0
     results = []
-    coins = {}  # {币种: 数量} 汇总今天新领取的
+    coins = {}       # {币种: 数量} 汇总今天新领取的
+    total_copper = 0  # 各账号铜币总余额合计
+    bal_count = 0     # 成功解析到余额的账号数
     for name, cookie in accounts:
         try:
-            success, reward = checkin(name, cookie)
+            success, reward, balance = checkin(name, cookie)
             if success:
                 ok += 1
-                results.append(f"✅ <b>{name}</b>\n   └ {reward}")
+                line = f"✅ <b>{name}</b>\n   └ {reward}"
+                if balance and "铜币" in balance:
+                    line += f"\n   └ 💰 铜币余额 <b>{balance['铜币']}</b>"
+                    total_copper += balance["铜币"]
+                    bal_count += 1
+                results.append(line)
                 # 提取奖励数量汇总
                 for amt, unit in re.findall(r'(\d+)\s*(铜币|银币|金币)', reward):
                     coins[unit] = coins.get(unit, 0) + int(amt)
@@ -249,10 +291,13 @@ def main():
         msg += f"💎 今日收获 · <b>{coin_str}</b>"
     else:
         msg += "💎 今日收获 · 无"
+    if bal_count:
+        msg += f"\n🏦 铜币总余额 · <b>{total_copper}</b>"
+        if len(accounts) > 1:
+            msg += f"（{bal_count} 个账号合计）"
     send_telegram(msg)
 
     sys.exit(0 if ok == len(accounts) else 1)
-
 
 if __name__ == "__main__":
     main()
