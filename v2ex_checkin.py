@@ -5,7 +5,8 @@ V2EX 每日自动签到脚本
 =====================
 
 原理：带 Cookie 访问 /mission/daily → 解析 once token → 请求 /mission/daily/redeem?once=xxx 完成签到。
-签到后同时统计：连续签到天数、账户余额（金/银/铜，1金=100银=10000铜），在日志与 Telegram 通知中展示。
+签到后同时统计：今日获得奖励（已签过则从 /balance 账单读取）、连续签到天数、账户余额
+（金/银/铜，1金=100银=10000铜），在日志与 Telegram 通知中展示。
 
 【获取 Cookie】
   未开 2FA 的账号只需 A2 一个 Cookie；开了 2FA 的账号需完整 Cookie 串（含 A2O 等）
@@ -136,6 +137,24 @@ def _extract_reward(html):
             return f"获得 {m.group(1)} {m.group(2)}"
     return ""
 
+def _fetch_today_reward(session):
+    """已签过的账号从 /balance 账单提取今日奖励，返回 '获得 X 铜币' 或 ''
+
+    "已成功领取 X 铜币"提示只在领取瞬间显示，刷新即消失；
+    但 /balance 账单第一行永远是当天的每日登录奖励记录：
+      <span class="gray">20261111 的每日登录奖励 15 铜币</span>
+    锚定当天日期（北京时间），不会误取历史记录
+    """
+    try:
+        r = session.get(f"{BASE_URL}/balance", timeout=TIMEOUT, allow_redirects=True)
+        if r.status_code != 200:
+            return ""
+        today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d")
+        m = re.search(today + r'\s*的每日登录奖励[^<]*?(\d+)\s*(铜币|银币|金币)', r.text)
+        return f"获得 {m.group(1)} {m.group(2)}" if m else ""
+    except requests.RequestException:
+        return ""
+
 def _extract_days(html):
     """提取连续登录天数，返回 '已连续登录 X 天' 或 ''
 
@@ -222,7 +241,8 @@ def checkin(name, cookie):
     days = _extract_days(r.text)
 
     if "每日登录奖励已领取" in r.text:
-        reward = _extract_reward(r.text)
+        # 签到页拿不到奖励数（提示只在领取瞬间出现），兜底从 /balance 账单读今日记录
+        reward = _extract_reward(r.text) or _fetch_today_reward(s)
         msg = f"今日已签过（{reward}）" if reward else "今日已签过"
         log(name, f"OK {msg}" + _day_suffix(days) + _bal_suffix(balance))
         return True, msg, balance, days
@@ -260,6 +280,12 @@ def checkin(name, cookie):
             log(name, f"OK 签到成功（{reward}）" + _day_suffix(days) + _bal_suffix(balance))
             return True, reward, balance, days
 
+    # 6. 兜底：从 /balance 账单读今日奖励记录
+    reward = _fetch_today_reward(s)
+    if reward:
+        log(name, f"OK 签到成功（{reward}）" + _day_suffix(days) + _bal_suffix(balance))
+        return True, reward, balance, days
+
     # 诊断：打印疑似片段，方便下次精确定位
     for page in pages:
         for kw in ["铜币", "银币", "金币", "领取", "奖励"]:
@@ -283,7 +309,7 @@ def main():
     log("系统", f"开始签到，共 {len(accounts)} 个账号")
     ok = 0
     results = []
-    coins = {}      # {币种: 数量} 汇总今天新领取的
+    coins = {}      # {币种: 数量} 汇总今日获得的奖励
     total_bal = {}  # {币种: 数量} 汇总各账号余额
     bal_count = 0   # 成功解析到余额的账号数
     for name, cookie in accounts:
