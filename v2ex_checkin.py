@@ -6,7 +6,7 @@ V2EX 每日自动签到脚本
 
 原理：带 Cookie 访问 /mission/daily → 解析 once token → 请求 /mission/daily/redeem?once=xxx 完成签到。
 签到后同时统计：今日获得奖励（已签过则从 /balance 账单读取）、连续签到天数、账户余额
-（金/银/铜，1金=100银=10000铜），在日志与 Telegram 通知中展示。
+（金/银/铜，1金=100银=10000铜），在日志与通知中展示。
 
 【获取 Cookie】
   未开 2FA 的账号只需 A2 一个 Cookie；开了 2FA 的账号需完整 Cookie 串（含 A2O 等）
@@ -44,6 +44,14 @@ V2EX 每日自动签到脚本
     TG_CHAT_ID   — 你的 Chat ID（通过 @userinfobot 获取）
   未配置则自动跳过，不影响签到。
   GitHub Actions 用户：把这两个值加到仓库 Secrets 里即可。
+
+【企业微信应用卡片通知】（可选）
+  配置 WECOM_APPS 环境变量，值为 JSON 数组，允许配置一个或多个应用：
+    WECOM_APPS='[{"corp_id":"wwxxxx","corp_secret":"xxxx","agent_id":1000002,"thumb_media_id":"MEDIA_ID","to_user":"@all"}]'
+  说明：
+    - thumb_media_id 为已上传到企业微信的图片素材 ID（用于图文卡片封面）
+    - to_user 可选，默认 @all
+    - 未配置或数组为空时自动跳过
 """
 
 import os
@@ -51,6 +59,7 @@ import re
 import sys
 import json
 import time
+import html
 from datetime import datetime, timezone, timedelta
 
 try:
@@ -87,8 +96,91 @@ def send_telegram(text):
     except Exception as e:
         log("TG", f"通知发送异常: {e}")
 
+def send_wecom(plain_text):
+    """将重新排版的纯文本签到结果作为企业微信图文卡片发送。"""
+    raw_apps = os.getenv("WECOM_APPS", "").strip()
+    if not raw_apps:
+        return
+
+    try:
+        apps = json.loads(raw_apps)
+        if not isinstance(apps, list):
+            raise ValueError("WECOM_APPS 必须是 JSON 数组")
+    except (json.JSONDecodeError, ValueError) as e:
+        log("企业微信", f"WECOM_APPS 格式错误（应为 JSON 数组）: {e}")
+        return
+
+    if not apps:
+        return
+
+    now_bj = datetime.now(timezone(timedelta(hours=8)))
+    title = f"V2EX 每日签到 - {now_bj:%Y-%m-%d}"
+    # mpnews 的 content 字段要求 HTML；正文内容本身保持纯文本，仅将换行转成卡片换行标签并转义。
+    content = "<br/>".join(html.escape(line) for line in plain_text.splitlines())
+    digest = plain_text.replace("\n", " ").strip()[:100]
+
+    for index, app in enumerate(apps, start=1):
+        if not isinstance(app, dict):
+            log("企业微信", f"WECOM_APPS 第 {index} 项格式错误，应为对象")
+            continue
+
+        corp_id = str(app.get("corp_id", "")).strip()
+        corp_secret = str(app.get("corp_secret", "")).strip()
+        thumb_media_id = str(app.get("thumb_media_id", "")).strip()
+        agent_id = app.get("agent_id")
+        if (not corp_id or not corp_secret or not thumb_media_id
+                or agent_id is None or str(agent_id).strip() == ""):
+            log("企业微信", f"WECOM_APPS 第 {index} 项缺少 corp_id、corp_secret、agent_id 或 thumb_media_id")
+            continue
+
+        try:
+            agent_id = int(agent_id)
+        except (TypeError, ValueError):
+            log("企业微信", f"WECOM_APPS 第 {index} 项 agent_id 必须是整数")
+            continue
+
+        try:
+            token_resp = requests.get(
+                "https://qyapi.weixin.qq.com/cgi-bin/gettoken",
+                params={"corpid": corp_id, "corpsecret": corp_secret},
+                timeout=15,
+            )
+            token_resp.raise_for_status()
+            token_data = token_resp.json()
+            access_token = token_data.get("access_token")
+            if token_data.get("errcode") != 0 or not access_token:
+                log("企业微信", f"应用 {index} 获取 access_token 失败: {token_data.get('errmsg', '未知错误')}")
+                continue
+
+            payload = {
+                "touser": str(app.get("to_user", "@all")).strip() or "@all",
+                "msgtype": "mpnews",
+                "agentid": agent_id,
+                "mpnews": {
+                    "articles": [{
+                        "title": title,
+                        "thumb_media_id": thumb_media_id,
+                        "content": content,
+                        "digest": digest,
+                    }]
+                },
+                "safe": 0,
+            }
+            resp = requests.post(
+                "https://qyapi.weixin.qq.com/cgi-bin/message/send",
+                params={"access_token": access_token},
+                json=payload,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+            if result.get("errcode") != 0:
+                log("企业微信", f"应用 {index} 通知发送失败: {result.get('errmsg', '未知错误')}")
+        except (requests.RequestException, ValueError) as e:
+            log("企业微信", f"应用 {index} 通知发送异常: {e}")
+
 def load_config():
-    """加载账号配置，返回 [(name, cookie), ...]
+    """加载账号配置，返�� [(name, cookie), ...]
 
     优先级（高→低，可叠加）：
       1. V2EX_ACCOUNTS 环境变量（JSON 数组，多账号）
@@ -309,6 +401,7 @@ def main():
     log("系统", f"开始签到，共 {len(accounts)} 个账号")
     ok = 0
     results = []
+    wecom_results = []
     coins = {}      # {币种: 数量} 汇总今日获得的奖励
     total_bal = {}  # {币种: 数量} 汇总各账号余额
     bal_count = 0   # 成功解析到余额的账号数
@@ -318,31 +411,37 @@ def main():
             if success:
                 ok += 1
                 line = f"✅ <b>{name}</b>\n   └ {reward}"
+                wecom_line = f"✅ {name}\n   奖励：{reward}"
                 if days:
                     line += f"\n   └ 🔥 <b>{days}</b>"
+                    wecom_line += f"\n   连续签到：{days}"
                 if balance:
                     line += f"\n   └ 💰 <b>{_bal_text(balance)}</b>"
+                    wecom_line += f"\n   账户余额：{_bal_text(balance)}"
                     for u, v in balance.items():
                         total_bal[u] = total_bal.get(u, 0) + v
                     bal_count += 1
                 results.append(line)
+                wecom_results.append(wecom_line)
                 # 提取奖励数量汇总
                 for amt, unit in re.findall(r'(\d+)\s*(铜币|银币|金币)', reward):
                     coins[unit] = coins.get(unit, 0) + int(amt)
             else:
                 results.append(f"❌ <b>{name}</b>\n   └ {reward}")
+                wecom_results.append(f"❌ {name}\n   状态：{reward}")
         except requests.RequestException as e:
             log(name, f"X 网络错误: {e}")
             results.append(f"❌ <b>{name}</b>\n   └ 网络错误")
+            wecom_results.append(f"❌ {name}\n   状态：网络错误")
         time.sleep(2)  # 多账号间隔，避免请求过快
 
     log("系统", f"完成：{ok}/{len(accounts)} 成功")
 
-    # Telegram 通知（卡片式排版）
     now_bj = datetime.now(timezone(timedelta(hours=8)))
     sep = "━━━━━━━━━━━━━━━━━━"
     icon = "🎯" if ok == len(accounts) else "⚠️"
 
+    # Telegram 保留 HTML 格式
     msg = f"<b>{icon} V2EX 每日签到</b>\n"
     msg += f"{sep}\n"
     msg += f"⏰ {now_bj:%Y-%m-%d %H:%M}\n"
@@ -356,10 +455,27 @@ def main():
     else:
         msg += "💎 今日收获 · 无"
     # 单账号余额已在上方显示，不再重复；多账号才输出合计
+    total_text = ""
     if bal_count and len(accounts) > 1:
         total = _norm_copper(_to_copper(total_bal))
-        msg += f"\n🏦 合计 <b>{_bal_text(total)}</b>"
+        total_text = _bal_text(total)
+        msg += f"\n🏦 合计 <b>{total_text}</b>"
     send_telegram(msg)
+
+    # 企业微信卡片使用独立的纯文本排版，不依赖 Telegram 的 HTML 消息。
+    wecom_lines = [
+        f"{icon} V2EX 每日签到",
+        sep,
+        f"时间：{now_bj:%Y-%m-%d %H:%M}",
+        f"签到成功：{ok}/{len(accounts)}",
+        sep,
+        "\n\n".join(wecom_results),
+        sep,
+        f"今日收获：{'，'.join(f'{v} {k}' for k, v in coins.items()) if coins else '无'}",
+    ]
+    if total_text:
+        wecom_lines.append(f"多账号余额合计：{total_text}")
+    send_wecom("\n".join(wecom_lines))
 
     sys.exit(0 if ok == len(accounts) else 1)
 
