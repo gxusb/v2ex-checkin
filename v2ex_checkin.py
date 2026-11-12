@@ -83,7 +83,7 @@ def send_telegram(text):
     token = os.getenv("TG_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TG_CHAT_ID", "").strip()
     if not token or not chat_id:
-        return  # 未配置则跳过，不影响签到
+        return
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
@@ -97,11 +97,10 @@ def send_telegram(text):
         log("TG", f"通知发送异常: {e}")
 
 def send_wecom(plain_text):
-    """将重新排版的纯文本签到结果作为企业微信图文卡片发送。"""
+    """以纯文本内容排版后，作为企业微信图文卡片发送。"""
     raw_apps = os.getenv("WECOM_APPS", "").strip()
     if not raw_apps:
         return
-
     try:
         apps = json.loads(raw_apps)
         if not isinstance(apps, list):
@@ -109,13 +108,12 @@ def send_wecom(plain_text):
     except (json.JSONDecodeError, ValueError) as e:
         log("企业微信", f"WECOM_APPS 格式错误（应为 JSON 数组）: {e}")
         return
-
     if not apps:
         return
 
     now_bj = datetime.now(timezone(timedelta(hours=8)))
     title = f"V2EX 每日签到 - {now_bj:%Y-%m-%d}"
-    # mpnews 的 content 字段要求 HTML；正文内容本身保持纯文本，仅将换行转成卡片换行标签并转义。
+    # 企业微信 mpnews 接收 HTML；通知文字采用纯文本模板，转义后仅用 <br/> 表示换行。
     content = "<br/>".join(html.escape(line) for line in plain_text.splitlines())
     digest = plain_text.replace("\n", " ").strip()[:100]
 
@@ -123,7 +121,6 @@ def send_wecom(plain_text):
         if not isinstance(app, dict):
             log("企业微信", f"WECOM_APPS 第 {index} 项格式错误，应为对象")
             continue
-
         corp_id = str(app.get("corp_id", "")).strip()
         corp_secret = str(app.get("corp_secret", "")).strip()
         thumb_media_id = str(app.get("thumb_media_id", "")).strip()
@@ -132,46 +129,34 @@ def send_wecom(plain_text):
                 or agent_id is None or str(agent_id).strip() == ""):
             log("企业微信", f"WECOM_APPS 第 {index} 项缺少 corp_id、corp_secret、agent_id 或 thumb_media_id")
             continue
-
         try:
             agent_id = int(agent_id)
         except (TypeError, ValueError):
             log("企业微信", f"WECOM_APPS 第 {index} 项 agent_id 必须是整数")
             continue
-
         try:
             token_resp = requests.get(
                 "https://qyapi.weixin.qq.com/cgi-bin/gettoken",
-                params={"corpid": corp_id, "corpsecret": corp_secret},
-                timeout=15,
-            )
+                params={"corpid": corp_id, "corpsecret": corp_secret}, timeout=15)
             token_resp.raise_for_status()
             token_data = token_resp.json()
             access_token = token_data.get("access_token")
             if token_data.get("errcode") != 0 or not access_token:
                 log("企业微信", f"应用 {index} 获取 access_token 失败: {token_data.get('errmsg', '未知错误')}")
                 continue
-
             payload = {
                 "touser": str(app.get("to_user", "@all")).strip() or "@all",
                 "msgtype": "mpnews",
                 "agentid": agent_id,
-                "mpnews": {
-                    "articles": [{
-                        "title": title,
-                        "thumb_media_id": thumb_media_id,
-                        "content": content,
-                        "digest": digest,
-                    }]
-                },
+                "mpnews": {"articles": [{
+                    "title": title, "thumb_media_id": thumb_media_id,
+                    "content": content, "digest": digest,
+                }]},
                 "safe": 0,
             }
             resp = requests.post(
                 "https://qyapi.weixin.qq.com/cgi-bin/message/send",
-                params={"access_token": access_token},
-                json=payload,
-                timeout=15,
-            )
+                params={"access_token": access_token}, json=payload, timeout=15)
             resp.raise_for_status()
             result = resp.json()
             if result.get("errcode") != 0:
@@ -180,7 +165,7 @@ def send_wecom(plain_text):
             log("企业微信", f"应用 {index} 通知发送异常: {e}")
 
 def load_config():
-    """加载账号配置，返�� [(name, cookie), ...]
+    """加载账号配置，返回 [(name, cookie), ...]
 
     优先级（高→低，可叠加）：
       1. V2EX_ACCOUNTS 环境变量（JSON 数组，多账号）
@@ -188,8 +173,6 @@ def load_config():
       3. config.json 文件
     """
     accounts = []
-
-    # 1. V2EX_ACCOUNTS：JSON 数组，支持多账号
     env_accounts = os.getenv("V2EX_ACCOUNTS", "").strip()
     if env_accounts:
         try:
@@ -197,13 +180,9 @@ def load_config():
                 accounts.append((a.get("name", "account"), a["cookie"]))
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             sys.exit(f"V2EX_ACCOUNTS 格式错误（应为 JSON 数组）: {e}")
-
-    # 2. V2EX_COOKIE：单账号
     env_cookie = os.getenv("V2EX_COOKIE", "").strip()
     if env_cookie:
         accounts.append(("env", env_cookie))
-
-    # 3. config.json
     cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
     if os.path.exists(cfg_path):
         with open(cfg_path, "r", encoding="utf-8") as f:
@@ -230,13 +209,7 @@ def _extract_reward(html):
     return ""
 
 def _fetch_today_reward(session):
-    """已签过的账号从 /balance 账单提取今日奖励，返回 '获得 X 铜币' 或 ''
-
-    "已成功领取 X 铜币"提示只在领取瞬间显示，刷新即消失；
-    但 /balance 账单第一行永远是当天的每日登录奖励记录：
-      <span class="gray">20261111 的每日登录奖励 15 铜币</span>
-    锚定当天日期（北京时间），不会误取历史记录
-    """
+    """已签过的账号从 /balance 账单提取今日奖励，返回奖励描述或空字符串。"""
     try:
         r = session.get(f"{BASE_URL}/balance", timeout=TIMEOUT, allow_redirects=True)
         if r.status_code != 200:
@@ -248,26 +221,15 @@ def _fetch_today_reward(session):
         return ""
 
 def _extract_days(html):
-    """提取连续登录天数，返回 '已连续登录 X 天' 或 ''
-
-    兼容新旧页面结构（旧版文本直接在 cell 里，新版包在 <span> 中），只锚定文字本身
-    """
     m = re.search(r'已连续登录\s*(\d+)\s*天', html)
     return f"已连续登录 {m.group(1)} 天" if m else ""
 
 def _extract_balance(html):
-    """从页面右上角余额区提取账户余额（登录后每个页面都有，无需额外请求）
-
-    HTML 形如：<a href="/balance" class="balance_area">1 <img gold> 61 <img silver> 56 <img bronze></a>
-    返回 {"金币": 1, "银币": 61, "铜币": 56}，解析失败返回 None
-    """
     m = re.search(r'class="balance_area"[^>]*>(.*?)</(?:a|div)>', html, re.S)
     if not m:
         return None
     area = m.group(1)
     units = (("gold", "金币"), ("silver", "银币"), ("bronze", "铜币"))
-
-    # 方式1：数字紧邻对应币种图标（V2EX 现行结构：数字在 img 前）
     res = {}
     for icon, unit in units:
         mm = re.search(r'(\d+)\s*<img[^>]*' + icon, area)
@@ -275,110 +237,79 @@ def _extract_balance(html):
             res[unit] = int(mm.group(1))
     if len(res) == 3:
         return res
-
-    # 方式2：兜底——去掉所有标签后按顺序取数字（金、银、铜）
     nums = re.findall(r'\d+', re.sub(r'<[^>]+>', ' ', area))
     if len(nums) >= 3:
         return {unit: int(n) for (_, unit), n in zip(units, nums[:3])}
     return None
 
 def _fmt_balance(balance):
-    """紧凑格式，如 '1金61银56铜'（金/银为 0 时省略）"""
     return "".join(f"{balance[u]}{u[0]}" for u in ("金币", "银币", "铜币")
                    if u in balance and (balance[u] or u == "铜币"))
 
 def _to_copper(balance):
-    """余额折合铜币总数"""
     return sum(balance.get(u, 0) * r for u, r in COPPER_RATE.items())
 
 def _norm_copper(c):
-    """铜币总数 → 规范金/银/铜表示（用于多账号汇总进位）"""
     return {"金币": c // 10000, "银币": c % 10000 // 100, "铜币": c % 100}
 
 def _bal_text(balance):
-    """'16156铜（1金61银56铜）'，纯铜号简化为 '512铜'"""
     c = _to_copper(balance)
     if balance.get("金币") or balance.get("银币"):
         return f"{c}铜（{_fmt_balance(balance)}）"
     return f"{c}铜"
 
-def _day_suffix(days):
-    """日志后缀"""
-    return f"，{days}" if days else ""
-
-def _bal_suffix(balance):
-    """日志后缀"""
-    return f"，余额 {_bal_text(balance)}" if balance else ""
+def _reward_text(reward):
+    m = re.search(r'(\d+)\s*(铜币|银币|金币)', reward or "")
+    return f"+{m.group(1)} {m.group(2)}" if m else "未识别"
 
 def checkin(name, cookie):
-    """签到，返回 (success: bool, reward: str, balance: dict|None, days: str)"""
+    """签到，返回 (success, reward, balance, days)"""
     s = requests.Session()
     s.headers.update({
-        "User-Agent": UA,
-        "Cookie": cookie,
+        "User-Agent": UA, "Cookie": cookie,
         "Referer": f"{BASE_URL}/mission/daily",
         "Accept-Language": "zh-CN,zh;q=0.9",
     })
-
-    # 1. 访问签到页
     r = s.get(f"{BASE_URL}/mission/daily", timeout=TIMEOUT, allow_redirects=True)
-
-    # 未登录会重定向到 /signin，或页面提示需登录
     if "/signin" in r.url or "You need to sign in" in r.text or "请先登录" in r.text:
         log(name, "X 未登录或 Cookie 已失效")
         return False, "未登录或 Cookie 已失效", None, ""
 
-    # 页面右上角余额区 + 连续登录天数
     balance = _extract_balance(r.text)
     days = _extract_days(r.text)
-
     if "每日登录奖励已领取" in r.text:
-        # 签到页拿不到奖励数（提示只在领取瞬间出现），兜底从 /balance 账单读今日记录
         reward = _extract_reward(r.text) or _fetch_today_reward(s)
         msg = f"今日已签过（{reward}）" if reward else "今日已签过"
-        log(name, f"OK {msg}" + _day_suffix(days) + _bal_suffix(balance))
+        log(name, f"OK {msg}" + (f"，{days}" if days else "") + (f"，余额 {_bal_text(balance)}" if balance else ""))
         return True, msg, balance, days
 
-    # 2. 提取 once token
     m = re.search(r'/mission/daily/redeem\?once=(\d+)', r.text)
     if not m:
         m = re.search(r'once=(\d+)', r.text)
     if not m:
         log(name, "X 未找到签到 token，页面结构可能已变化")
         return False, "未找到签到 token", None, ""
-    once = m.group(1)
 
-    # 3. 领取奖励
-    r2 = s.get(f"{BASE_URL}/mission/daily/redeem?once={once}",
-               timeout=TIMEOUT, allow_redirects=True)
+    r2 = s.get(f"{BASE_URL}/mission/daily/redeem?once={m.group(1)}", timeout=TIMEOUT, allow_redirects=True)
     if r2.status_code != 200:
         log(name, f"X 签到失败 HTTP {r2.status_code}")
         return False, f"签到失败 HTTP {r2.status_code}", None, ""
 
-    # 4. 领取后从"再次请求的签到页"和 redeem 响应里提取奖励
-    #    （V2EX 的"已成功领取 X 铜币"提示框只在领取瞬间显示，刷新即消失）
     time.sleep(1)
     r3 = s.get(f"{BASE_URL}/mission/daily", timeout=TIMEOUT, allow_redirects=True)
     pages = [r3.text if r3.status_code == 200 else "", r2.text]
-
-    # 领取后刷新余额和连续天数（优先用最新页面）
-    balance = (_extract_balance(pages[0]) or _extract_balance(r2.text) or balance)
+    balance = _extract_balance(pages[0]) or _extract_balance(r2.text) or balance
     days = _extract_days(pages[0]) or _extract_days(r2.text) or days
-
-    # 5. 多重正则提取奖励（两个页面都试）
     for page in pages:
         reward = _extract_reward(page)
         if reward:
-            log(name, f"OK 签到成功（{reward}）" + _day_suffix(days) + _bal_suffix(balance))
+            log(name, f"OK 签到成功（{reward}）" + (f"，{days}" if days else "") + (f"，余额 {_bal_text(balance)}" if balance else ""))
             return True, reward, balance, days
-
-    # 6. 兜底：从 /balance 账单读今日奖励记录
     reward = _fetch_today_reward(s)
     if reward:
-        log(name, f"OK 签到成功（{reward}）" + _day_suffix(days) + _bal_suffix(balance))
+        log(name, f"OK 签到成功（{reward}）" + (f"，{days}" if days else "") + (f"，余额 {_bal_text(balance)}" if balance else ""))
         return True, reward, balance, days
 
-    # 诊断：打印疑似片段，方便下次精确定位
     for page in pages:
         for kw in ["铜币", "银币", "金币", "领取", "奖励"]:
             idx = page.find(kw)
@@ -389,8 +320,7 @@ def checkin(name, cookie):
         else:
             continue
         break
-
-    log(name, "OK 签到成功" + _day_suffix(days) + _bal_suffix(balance))
+    log(name, "OK 签到成功" + (f"，{days}" if days else "") + (f"，余额 {_bal_text(balance)}" if balance else ""))
     return True, "签到成功（奖励信息未识别）", balance, days
 
 def main():
@@ -400,83 +330,62 @@ def main():
 
     log("系统", f"开始签到，共 {len(accounts)} 个账号")
     ok = 0
-    results = []
-    wecom_results = []
-    coins = {}      # {币种: 数量} 汇总今日获得的奖励
-    total_bal = {}  # {币种: 数量} 汇总各账号余额
-    bal_count = 0   # 成功解析到余额的账号数
+    account_results = []
+    coins = {}
+    total_bal = {}
+    bal_count = 0
+
     for name, cookie in accounts:
         try:
             success, reward, balance, days = checkin(name, cookie)
             if success:
                 ok += 1
-                line = f"✅ <b>{name}</b>\n   └ {reward}"
-                wecom_line = f"✅ {name}\n   奖励：{reward}"
-                if days:
-                    line += f"\n   └ 🔥 <b>{days}</b>"
-                    wecom_line += f"\n   连续签到：{days}"
-                if balance:
-                    line += f"\n   └ 💰 <b>{_bal_text(balance)}</b>"
-                    wecom_line += f"\n   账户余额：{_bal_text(balance)}"
-                    for u, v in balance.items():
-                        total_bal[u] = total_bal.get(u, 0) + v
-                    bal_count += 1
-                results.append(line)
-                wecom_results.append(wecom_line)
-                # 提取奖励数量汇总
+                status = f"✅ 今日已签过" if "今日已签过" in reward else "✅ 签到成功"
+                account_results.append({"name": name, "success": True, "status": status,
+                                        "reward": reward, "balance": balance, "days": days})
                 for amt, unit in re.findall(r'(\d+)\s*(铜币|银币|金币)', reward):
                     coins[unit] = coins.get(unit, 0) + int(amt)
+                if balance:
+                    for unit, value in balance.items():
+                        total_bal[unit] = total_bal.get(unit, 0) + value
+                    bal_count += 1
             else:
-                results.append(f"❌ <b>{name}</b>\n   └ {reward}")
-                wecom_results.append(f"❌ {name}\n   状态：{reward}")
+                account_results.append({"name": name, "success": False, "status": "❌ 签到失败",
+                                        "reward": reward, "balance": None, "days": ""})
         except requests.RequestException as e:
             log(name, f"X 网络错误: {e}")
-            results.append(f"❌ <b>{name}</b>\n   └ 网络错误")
-            wecom_results.append(f"❌ {name}\n   状态：网络错误")
-        time.sleep(2)  # 多账号间隔，避免请求过快
+            account_results.append({"name": name, "success": False, "status": "❌ 网络错误",
+                                    "reward": "网络错误", "balance": None, "days": ""})
+        time.sleep(2)
 
     log("系统", f"完成：{ok}/{len(accounts)} 成功")
-
     now_bj = datetime.now(timezone(timedelta(hours=8)))
-    sep = "━━━━━━━━━━━━━━━━━━"
-    icon = "🎯" if ok == len(accounts) else "⚠️"
+    total_reward = "，".join(f"{value} {unit}" for unit, value in coins.items()) if coins else "无"
+    total_balance = _norm_copper(_to_copper(total_bal)) if bal_count and len(accounts) > 1 else None
 
-    # Telegram 保留 HTML 格式
-    msg = f"<b>{icon} V2EX 每日签到</b>\n"
-    msg += f"{sep}\n"
-    msg += f"⏰ {now_bj:%Y-%m-%d %H:%M}\n"
-    msg += f"📊 成功 <b>{ok}</b>/<b>{len(accounts)}</b>\n"
-    msg += f"{sep}\n"
-    msg += "\n".join(results)
-    msg += f"\n{sep}\n"
-    if coins:
-        coin_str = "，".join(f"{v} {k}" for k, v in coins.items())
-        msg += f"💎 今日收获 · <b>{coin_str}</b>"
-    else:
-        msg += "💎 今日收获 · 无"
-    # 单账号余额已在上方显示，不再重复；多账号才输出合计
-    total_text = ""
-    if bal_count and len(accounts) > 1:
-        total = _norm_copper(_to_copper(total_bal))
-        total_text = _bal_text(total)
-        msg += f"\n🏦 合计 <b>{total_text}</b>"
-    send_telegram(msg)
+    # 统一纯文本模板，Telegram 与企业微信共用，不嵌入 HTML 标记。
+    lines = []
+    for index, result in enumerate(account_results, start=1):
+        lines.append(f"【账号 {index}】")
+        lines.append(f"👤 账号信息: {result['name']}")
+        reward = _reward_text(result["reward"]) if result["success"] else result["reward"]
+        lines.append(f"📊 签到状态: {result['status']} ({ok}/{len(accounts)})，获得 {reward.replace('+', '')}" if result["success"] else f"📊 签到状态: {result['status']} ({ok}/{len(accounts)})，{result['reward']}")
+        if result["balance"]:
+            balance = result["balance"]
+            copper = _to_copper(balance)
+            asset_detail = " ".join(f"{balance.get(unit, 0)}{short}" for unit, short in (("金币", "金"), ("银币", "银"), ("铜币", "铜")))
+            lines.append(f"📦 账户资产：")
+            lines.append(f"   铜币：[{reward}] 总计 {copper} ({asset_detail})")
+        if result["days"]:
+            lines.append(f"   连续：{result['days']}")
+        lines.append(f"🕐 完成时间: {now_bj:%Y-%m-%d %H:%M:%S}")
+        if index != len(account_results):
+            lines.append("")
+    text = "\n".join(lines)
 
-    # 企业微信卡片使用独立的纯文本排版，不依赖 Telegram 的 HTML 消息。
-    wecom_lines = [
-        f"{icon} V2EX 每日签到",
-        sep,
-        f"时间：{now_bj:%Y-%m-%d %H:%M}",
-        f"签到成功：{ok}/{len(accounts)}",
-        sep,
-        "\n\n".join(wecom_results),
-        sep,
-        f"今日收获：{'，'.join(f'{v} {k}' for k, v in coins.items()) if coins else '无'}",
-    ]
-    if total_text:
-        wecom_lines.append(f"多账号余额合计：{total_text}")
-    send_wecom("\n".join(wecom_lines))
-
+    # Telegram Bot API 用纯文本发送，WeCom 使用同一份纯文本模板。
+    send_telegram(text)
+    send_wecom(text)
     sys.exit(0 if ok == len(accounts) else 1)
 
 if __name__ == "__main__":
