@@ -6,7 +6,7 @@ V2EX 每日自动签到脚本
 
 原理：带 Cookie 访问 /mission/daily → 解析 once token → 请求 /mission/daily/redeem?once=xxx 完成签到。
 签到后同时统计：今日获得奖励（已签过则从 /balance 账单读取）、连续签到天数、账户余额
-（金/银/铜，1金=100银=10000铜），在日志与 Telegram 通知中展示。
+（金/银/铜，1金=100银=10000铜），在日志与通知中展示。
 
 【获取 Cookie】
   未开 2FA 的账号只需 A2 一个 Cookie；开了 2FA 的账号需完整 Cookie 串（含 A2O 等）
@@ -44,6 +44,13 @@ V2EX 每日自动签到脚本
     TG_CHAT_ID   — 你的 Chat ID（通过 @userinfobot 获取）
   未配置则自动跳过，不影响签到。
   GitHub Actions 用户：把这两个值加到仓库 Secrets 里即可。
+
+【企业微信应用卡片通知】（可选）
+  配置 WECOM_APPS 环境变量，值为 JSON 数组，可配置一个或多个自建应用：
+    WECOM_APPS='[{"corp_id":"企业ID","corp_secret":"应用Secret","agent_id":1000002,"thumb_media_id":"图片MEDIA_ID","to_user":"@all"}]'
+  每项必填 corp_id、corp_secret、agent_id、thumb_media_id；to_user 可选，默认 @all。
+  thumb_media_id 是已上传到企业微信的图片素材 ID（用作图文卡片封面），不是图片 URL。
+  未配置或数组为空时自动跳过。GitHub Actions 用户可将其添加到仓库 Secrets。
 """
 
 import os
@@ -51,6 +58,7 @@ import re
 import sys
 import json
 import time
+import html
 from datetime import datetime, timezone, timedelta
 
 try:
@@ -86,6 +94,85 @@ def send_telegram(text):
             log("TG", f"通知发送失败 HTTP {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
         log("TG", f"通知发送异常: {e}")
+
+def send_wecom(text):
+    """向 WECOM_APPS 数组中配置的企业微信自建应用发送图文卡片。"""
+    raw_apps = os.getenv("WECOM_APPS", "").strip()
+    if not raw_apps:
+        return  # 未配置则跳过，不影响签到
+
+    try:
+        apps = json.loads(raw_apps)
+        if not isinstance(apps, list):
+            raise ValueError("必须是 JSON 数组")
+    except (json.JSONDecodeError, ValueError) as e:
+        log("企业微信", f"WECOM_APPS 格式错误（应为 JSON 数组）: {e}")
+        return
+
+    # 将 Telegram 使用的粗体标签改成图文消息中使用的 HTML 标签，并生成摘要。
+    article_content = text.replace("<b>", "<strong>").replace("</b>", "</strong>")
+    plain_text = html.unescape(re.sub(r"<[^>]+>", "", text))
+    digest = plain_text.replace("\n", " ").strip()[:100]
+    now_bj = datetime.now(timezone(timedelta(hours=8)))
+    title = f"V2EX 每日签到 - {now_bj:%Y-%m-%d}"
+
+    for index, app in enumerate(apps, start=1):
+        if not isinstance(app, dict):
+            log("企业微信", f"WECOM_APPS 第 {index} 项格式错误，应为对象")
+            continue
+        corp_id = str(app.get("corp_id", "")).strip()
+        corp_secret = str(app.get("corp_secret", "")).strip()
+        thumb_media_id = str(app.get("thumb_media_id", "")).strip()
+        agent_id = app.get("agent_id")
+        if (not corp_id or not corp_secret or not thumb_media_id
+                or agent_id is None or str(agent_id).strip() == ""):
+            log("企业微信", f"WECOM_APPS 第 {index} 项缺少 corp_id、corp_secret、agent_id 或 thumb_media_id")
+            continue
+        try:
+            agent_id = int(agent_id)
+        except (TypeError, ValueError):
+            log("企业微信", f"WECOM_APPS 第 {index} 项 agent_id 必须是整数")
+            continue
+
+        try:
+            token_resp = requests.get(
+                "https://qyapi.weixin.qq.com/cgi-bin/gettoken",
+                params={"corpid": corp_id, "corpsecret": corp_secret},
+                timeout=15,
+            )
+            token_resp.raise_for_status()
+            token_data = token_resp.json()
+            access_token = token_data.get("access_token")
+            if token_data.get("errcode") != 0 or not access_token:
+                log("企业微信", f"应用 {index} 获取 access_token 失败: {token_data.get('errmsg', '未知错误')}")
+                continue
+
+            payload = {
+                "touser": str(app.get("to_user", "@all")).strip() or "@all",
+                "msgtype": "mpnews",
+                "agentid": agent_id,
+                "mpnews": {
+                    "articles": [{
+                        "title": title,
+                        "thumb_media_id": thumb_media_id,
+                        "content": article_content,
+                        "digest": digest,
+                    }]
+                },
+                "safe": 0,
+            }
+            resp = requests.post(
+                "https://qyapi.weixin.qq.com/cgi-bin/message/send",
+                params={"access_token": access_token},
+                json=payload,
+                timeout=15,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+            if result.get("errcode") != 0:
+                log("企业微信", f"应用 {index} 通知发送失败: {result.get('errmsg', '未知错误')}")
+        except (requests.RequestException, ValueError) as e:
+            log("企业微信", f"应用 {index} 通知发送异常: {e}")
 
 def load_config():
     """加载账号配置，返回 [(name, cookie), ...]
@@ -338,7 +425,7 @@ def main():
 
     log("系统", f"完成：{ok}/{len(accounts)} 成功")
 
-    # Telegram 通知（卡片式排版）
+    # Telegram 和企业微信共用签到结果
     now_bj = datetime.now(timezone(timedelta(hours=8)))
     sep = "━━━━━━━━━━━━━━━━━━"
     icon = "🎯" if ok == len(accounts) else "⚠️"
@@ -360,6 +447,7 @@ def main():
         total = _norm_copper(_to_copper(total_bal))
         msg += f"\n🏦 合计 <b>{_bal_text(total)}</b>"
     send_telegram(msg)
+    send_wecom(msg)
 
     sys.exit(0 if ok == len(accounts) else 1)
 
