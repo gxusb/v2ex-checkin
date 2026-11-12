@@ -46,11 +46,12 @@ V2EX 每日自动签到脚本
   GitHub Actions 用户：把这两个值加到仓库 Secrets 里即可。
 
 【企业微信应用卡片通知】（可选）
-  配置 WECOM_APPS 环境变量，值为 JSON 数组，可配置一个或多个自建应用：
-    WECOM_APPS='[{"corp_id":"企业ID","corp_secret":"应用Secret","agent_id":1000002,"thumb_media_id":"图片MEDIA_ID","to_user":"@all"}]'
-  每项必填 corp_id、corp_secret、agent_id、thumb_media_id；to_user 可选，默认 @all。
-  thumb_media_id 是已上传到企业微信的图片素材 ID（用作图文卡片封面），不是图片 URL。
-  未配置或数组为空时自动跳过。GitHub Actions 用户可将其添加到仓库 Secrets。
+  配置 WECOM_APPS 环境变量，值为 JSON 数组，允许配置一个或多个应用：
+    WECOM_APPS='[{"corp_id":"wwxxxx","corp_secret":"xxxx","agent_id":1000002,"thumb_media_id":"MEDIA_ID","to_user":"@all"}]'
+  说明：
+    - thumb_media_id 为已上传到企业微信的图片素材 ID（用于图文卡片封面）
+    - to_user 可选，默认 @all
+    - 未配置或数组为空时自动跳过
 """
 
 import os
@@ -82,7 +83,7 @@ def send_telegram(text):
     token = os.getenv("TG_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TG_CHAT_ID", "").strip()
     if not token or not chat_id:
-        return  # 未配置则跳过，不影响签到
+        return
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
@@ -95,24 +96,50 @@ def send_telegram(text):
     except Exception as e:
         log("TG", f"通知发送异常: {e}")
 
+def _wecom_card_body(text):
+    """把 Telegram 风格的文本改成企业微信图文卡片 HTML 内容。"""
+    plain_text = html.unescape(re.sub(r"<[^>]+>", "", text))
+    lines = [line.strip() for line in plain_text.splitlines() if line.strip()]
+
+    # 标题必须显示在卡片顶部，避免内容为空
+    article_parts = [
+        "<div><strong>V2EX 每日签到</strong></div>"
+    ]
+
+    for line in lines:
+        if line.startswith(("⏰", "📊", "💎", "🏦")):
+            article_parts.append(f"<div>{html.escape(line)}</div>")
+        elif line.startswith(("✅", "❌")):
+            article_parts.append(f"<div>{html.escape(line)}</div>")
+        elif line.startswith("   └") or line.startswith("└"):
+            cleaned = re.sub(r"^\\s*└\\s*", "", line)
+            article_parts.append(f"<div>　{html.escape(cleaned)}</div>")
+        elif line.startswith("🔥"):
+            article_parts.append(f"<div>{html.escape(line)}</div>")
+        else:
+            article_parts.append(f"<div>{html.escape(line)}</div>")
+
+    return "<br/>".join(article_parts)
+
 def send_wecom(text):
-    """向 WECOM_APPS 数组中配置的企业微信自建应用发送图文卡片。"""
+    """通过企业微信自建应用发送图文卡片消息，使用 WECOM_APPS 数组配置。"""
     raw_apps = os.getenv("WECOM_APPS", "").strip()
     if not raw_apps:
-        return  # 未配置则跳过，不影响签到
+        return
 
     try:
         apps = json.loads(raw_apps)
         if not isinstance(apps, list):
-            raise ValueError("必须是 JSON 数组")
+            raise ValueError("WECOM_APPS 必须是 JSON 数组")
     except (json.JSONDecodeError, ValueError) as e:
         log("企业微信", f"WECOM_APPS 格式错误（应为 JSON 数组）: {e}")
         return
 
-    # 将 Telegram 使用的粗体标签改成图文消息中使用的 HTML 标签，并生成摘要。
-    article_content = text.replace("<b>", "<strong>").replace("</b>", "</strong>")
+    # 生成企业微信图文卡片
+    article_content = _wecom_card_body(text)
     plain_text = html.unescape(re.sub(r"<[^>]+>", "", text))
-    digest = plain_text.replace("\n", " ").strip()[:100]
+    digest = plain_text.replace("\\n", " ").strip()[:100]
+
     now_bj = datetime.now(timezone(timedelta(hours=8)))
     title = f"V2EX 每日签到 - {now_bj:%Y-%m-%d}"
 
@@ -120,14 +147,17 @@ def send_wecom(text):
         if not isinstance(app, dict):
             log("企业微信", f"WECOM_APPS 第 {index} 项格式错误，应为对象")
             continue
+
         corp_id = str(app.get("corp_id", "")).strip()
         corp_secret = str(app.get("corp_secret", "")).strip()
         thumb_media_id = str(app.get("thumb_media_id", "")).strip()
         agent_id = app.get("agent_id")
+
         if (not corp_id or not corp_secret or not thumb_media_id
                 or agent_id is None or str(agent_id).strip() == ""):
             log("企业微信", f"WECOM_APPS 第 {index} 项缺少 corp_id、corp_secret、agent_id 或 thumb_media_id")
             continue
+
         try:
             agent_id = int(agent_id)
         except (TypeError, ValueError):
@@ -161,6 +191,7 @@ def send_wecom(text):
                 },
                 "safe": 0,
             }
+
             resp = requests.post(
                 "https://qyapi.weixin.qq.com/cgi-bin/message/send",
                 params={"access_token": access_token},
@@ -176,7 +207,6 @@ def send_wecom(text):
 
 def load_config():
     """加载账号配置，返回 [(name, cookie), ...]
-
     优先级（高→低，可叠加）：
       1. V2EX_ACCOUNTS 环境变量（JSON 数组，多账号）
       2. V2EX_COOKIE 环境变量（单账号）
@@ -210,7 +240,7 @@ def load_config():
             accounts.append((cfg.get("name", "account"), cfg["cookie"]))
     return accounts
 
-def _extract_reward(html):
+def _extract_reward(html_text):
     """从签到页 HTML 提取奖励信息，返回 '获得 X 铜币' 或 ''"""
     patterns = [
         r'已成功领取每日登录奖励\s*(\d+)\s*(铜币|银币|金币)',
@@ -219,60 +249,45 @@ def _extract_reward(html):
         r'(\d+)\s*个?\s*(铜币|银币|金币)',
     ]
     for p in patterns:
-        m = re.search(p, html)
+        m = re.search(p, html_text)
         if m:
             return f"获得 {m.group(1)} {m.group(2)}"
     return ""
 
 def _fetch_today_reward(session):
-    """已签过的账号从 /balance 账单提取今日奖励，返回 '获得 X 铜币' 或 ''
-
-    "已成功领取 X 铜币"提示只在领取瞬间显示，刷新即消失；
-    但 /balance 账单第一行永远是当天的每日登录奖励记录：
-      <span class="gray">20261111 的每日登录奖励 15 铜币</span>
-    锚定当天日期（北京时间），不会误取历史记录
-    """
+    """已签过的账号从 /balance 账单提取今日奖励，返回 '获得 X 铜币' 或 ''"""
     try:
         r = session.get(f"{BASE_URL}/balance", timeout=TIMEOUT, allow_redirects=True)
         if r.status_code != 200:
             return ""
         today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d")
-        m = re.search(today + r'\s*的每日登录奖励[^<]*?(\d+)\s*(铜币|银币|金币)', r.text)
+        m = re.search(today + r'\\s*的每日登录奖励[^<]*?(\\d+)\\s*(铜币|银币|金币)', r.text)
         return f"获得 {m.group(1)} {m.group(2)}" if m else ""
     except requests.RequestException:
         return ""
 
-def _extract_days(html):
-    """提取连续登录天数，返回 '已连续登录 X 天' 或 ''
-
-    兼容新旧页面结构（旧版文本直接在 cell 里，新版包在 <span> 中），只锚定文字本身
-    """
-    m = re.search(r'已连续登录\s*(\d+)\s*天', html)
+def _extract_days(html_text):
+    """提取连续登录天数，返回 '已连续登录 X 天' 或 ''"""
+    m = re.search(r'已连续登录\\s*(\\d+)\\s*天', html_text)
     return f"已连续登录 {m.group(1)} 天" if m else ""
 
-def _extract_balance(html):
-    """从页面右上角余额区提取账户余额（登录后每个页面都有，无需额外请求）
-
-    HTML 形如：<a href="/balance" class="balance_area">1 <img gold> 61 <img silver> 56 <img bronze></a>
-    返回 {"金币": 1, "银币": 61, "铜币": 56}，解析失败返回 None
-    """
-    m = re.search(r'class="balance_area"[^>]*>(.*?)</(?:a|div)>', html, re.S)
+def _extract_balance(html_text):
+    """从页面右上角余额区提取账户余额，返回 {'金币': x, '银币': y, '铜币': z} 或 None"""
+    m = re.search(r'class=\"balance_area\"[^>]*>(.*?)</(?:a|div)>', html_text, re.S)
     if not m:
         return None
     area = m.group(1)
     units = (("gold", "金币"), ("silver", "银币"), ("bronze", "铜币"))
 
-    # 方式1：数字紧邻对应币种图标（V2EX 现行结构：数字在 img 前）
     res = {}
     for icon, unit in units:
-        mm = re.search(r'(\d+)\s*<img[^>]*' + icon, area)
+        mm = re.search(r'(\\d+)\\s*<img[^>]*' + icon, area)
         if mm:
             res[unit] = int(mm.group(1))
     if len(res) == 3:
         return res
 
-    # 方式2：兜底——去掉所有标签后按顺序取数字（金、银、铜）
-    nums = re.findall(r'\d+', re.sub(r'<[^>]+>', ' ', area))
+    nums = re.findall(r'\\d+', re.sub(r'<[^>]+>', ' ', area))
     if len(nums) >= 3:
         return {unit: int(n) for (_, unit), n in zip(units, nums[:3])}
     return None
@@ -298,11 +313,9 @@ def _bal_text(balance):
     return f"{c}铜"
 
 def _day_suffix(days):
-    """日志后缀"""
     return f"，{days}" if days else ""
 
 def _bal_suffix(balance):
-    """日志后缀"""
     return f"，余额 {_bal_text(balance)}" if balance else ""
 
 def checkin(name, cookie):
@@ -315,65 +328,51 @@ def checkin(name, cookie):
         "Accept-Language": "zh-CN,zh;q=0.9",
     })
 
-    # 1. 访问签到页
     r = s.get(f"{BASE_URL}/mission/daily", timeout=TIMEOUT, allow_redirects=True)
-
-    # 未登录会重定向到 /signin，或页面提示需登录
     if "/signin" in r.url or "You need to sign in" in r.text or "请先登录" in r.text:
         log(name, "X 未登录或 Cookie 已失效")
         return False, "未登录或 Cookie 已失效", None, ""
 
-    # 页面右上角余额区 + 连续登录天数
     balance = _extract_balance(r.text)
     days = _extract_days(r.text)
 
     if "每日登录奖励已领取" in r.text:
-        # 签到页拿不到奖励数（提示只在领取瞬间出现），兜底从 /balance 账单读今日记录
         reward = _extract_reward(r.text) or _fetch_today_reward(s)
         msg = f"今日已签过（{reward}）" if reward else "今日已签过"
         log(name, f"OK {msg}" + _day_suffix(days) + _bal_suffix(balance))
         return True, msg, balance, days
 
-    # 2. 提取 once token
-    m = re.search(r'/mission/daily/redeem\?once=(\d+)', r.text)
+    m = re.search(r'/mission/daily/redeem\\?once=(\\d+)', r.text)
     if not m:
-        m = re.search(r'once=(\d+)', r.text)
+        m = re.search(r'once=(\\d+)', r.text)
     if not m:
         log(name, "X 未找到签到 token，页面结构可能已变化")
         return False, "未找到签到 token", None, ""
-    once = m.group(1)
 
-    # 3. 领取奖励
-    r2 = s.get(f"{BASE_URL}/mission/daily/redeem?once={once}",
-               timeout=TIMEOUT, allow_redirects=True)
+    once = m.group(1)
+    r2 = s.get(f"{BASE_URL}/mission/daily/redeem?once={once}", timeout=TIMEOUT, allow_redirects=True)
     if r2.status_code != 200:
         log(name, f"X 签到失败 HTTP {r2.status_code}")
         return False, f"签到失败 HTTP {r2.status_code}", None, ""
 
-    # 4. 领取后从"再次请求的签到页"和 redeem 响应里提取奖励
-    #    （V2EX 的"已成功领取 X 铜币"提示框只在领取瞬间显示，刷新即消失）
     time.sleep(1)
     r3 = s.get(f"{BASE_URL}/mission/daily", timeout=TIMEOUT, allow_redirects=True)
     pages = [r3.text if r3.status_code == 200 else "", r2.text]
 
-    # 领取后刷新余额和连续天数（优先用最新页面）
     balance = (_extract_balance(pages[0]) or _extract_balance(r2.text) or balance)
     days = _extract_days(pages[0]) or _extract_days(r2.text) or days
 
-    # 5. 多重正则提取奖励（两个页面都试）
     for page in pages:
         reward = _extract_reward(page)
         if reward:
             log(name, f"OK 签到成功（{reward}）" + _day_suffix(days) + _bal_suffix(balance))
             return True, reward, balance, days
 
-    # 6. 兜底：从 /balance 账单读今日奖励记录
     reward = _fetch_today_reward(s)
     if reward:
         log(name, f"OK 签到成功（{reward}）" + _day_suffix(days) + _bal_suffix(balance))
         return True, reward, balance, days
 
-    # 诊断：打印疑似片段，方便下次精确定位
     for page in pages:
         for kw in ["铜币", "银币", "金币", "领取", "奖励"]:
             idx = page.find(kw)
@@ -396,9 +395,10 @@ def main():
     log("系统", f"开始签到，共 {len(accounts)} 个账号")
     ok = 0
     results = []
-    coins = {}      # {币种: 数量} 汇总今日获得的奖励
-    total_bal = {}  # {币种: 数量} 汇总各账号余额
-    bal_count = 0   # 成功解析到余额的账号数
+    coins = {}
+    total_bal = {}
+    bal_count = 0
+
     for name, cookie in accounts:
         try:
             success, reward, balance, days = checkin(name, cookie)
@@ -413,19 +413,17 @@ def main():
                         total_bal[u] = total_bal.get(u, 0) + v
                     bal_count += 1
                 results.append(line)
-                # 提取奖励数量汇总
-                for amt, unit in re.findall(r'(\d+)\s*(铜币|银币|金币)', reward):
+                for amt, unit in re.findall(r'(\\d+)\\s*(铜币|银币|金币)', reward):
                     coins[unit] = coins.get(unit, 0) + int(amt)
             else:
                 results.append(f"❌ <b>{name}</b>\n   └ {reward}")
         except requests.RequestException as e:
             log(name, f"X 网络错误: {e}")
             results.append(f"❌ <b>{name}</b>\n   └ 网络错误")
-        time.sleep(2)  # 多账号间隔，避免请求过快
+        time.sleep(2)
 
     log("系统", f"完成：{ok}/{len(accounts)} 成功")
 
-    # Telegram 和企业微信共用签到结果
     now_bj = datetime.now(timezone(timedelta(hours=8)))
     sep = "━━━━━━━━━━━━━━━━━━"
     icon = "🎯" if ok == len(accounts) else "⚠️"
@@ -442,10 +440,10 @@ def main():
         msg += f"💎 今日收获 · <b>{coin_str}</b>"
     else:
         msg += "💎 今日收获 · 无"
-    # 单账号余额已在上方显示，不再重复；多账号才输出合计
     if bal_count and len(accounts) > 1:
         total = _norm_copper(_to_copper(total_bal))
         msg += f"\n🏦 合计 <b>{_bal_text(total)}</b>"
+
     send_telegram(msg)
     send_wecom(msg)
 
