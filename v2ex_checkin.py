@@ -113,8 +113,8 @@ def send_wecom(plain_text):
 
     now_bj = datetime.now(timezone(timedelta(hours=8)))
     title = f"V2EX 每日签到 - {now_bj:%Y-%m-%d}"
-    # 企业微信 mpnews 接收 HTML；通知文字采用纯文本模板，转义后仅用 <br/> 表示换行。
-    content = "<br/>".join(html.escape(line) for line in plain_text.splitlines())
+    # 企业微信 mpnews 接收 HTML；使用标准 <br> 标签，确保卡片正文中的换行正常显示。
+    content = "<br>".join(html.escape(line) for line in plain_text.splitlines())
     digest = plain_text.replace("\n", " ").strip()[:100]
 
     for index, app in enumerate(apps, start=1):
@@ -369,7 +369,10 @@ def main():
         lines.append(f"【账号 {index}】")
         lines.append(f"👤 账号信息: {result['name']}")
         reward = _reward_text(result["reward"]) if result["success"] else result["reward"]
-        lines.append(f"📊 签到状态: {result['status']} ({ok}/{len(accounts)})，获得 {reward.replace('+', '')}" if result["success"] else f"📊 签到状态: {result['status']} ({ok}/{len(accounts)})，{result['reward']}")
+        if result["success"]:
+            lines.append(f"📊 签到状态: {result['status']} ({ok}/{len(accounts)})，获得 {reward.replace('+', '')}")
+        else:
+            lines.append(f"📊 签到状态: {result['status']} ({ok}/{len(accounts)})，{result['reward']}")
         if result["balance"]:
             balance = result["balance"]
             copper = _to_copper(balance)
