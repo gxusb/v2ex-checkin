@@ -166,6 +166,11 @@ def send_wecom(plain_text):
         except (requests.RequestException, ValueError) as e:
             log("企业微信", f"应用 {index} 通知发送异常: {e}")
 
+def send_notification(text):
+    """统一通知入口：依次调用已配置的通知渠道，未配置的渠道自动跳过。"""
+    send_telegram(text)
+    send_wecom(text)
+
 def load_config():
     """加载账号配置，返回 [(name, cookie), ...]
 
@@ -365,7 +370,7 @@ def main():
     total_reward = "，".join(f"{value} {unit}" for unit, value in coins.items()) if coins else "无"
     total_balance = _norm_copper(_to_copper(total_bal)) if bal_count and len(accounts) > 1 else None
 
-    # 统一纯文本模板，Telegram 与企业微信共用，不嵌入 HTML 标记。
+    # 统一纯文本模板，通知渠道共用。
     lines = []
     for index, result in enumerate(account_results, start=1):
         lines.append(f"【账号 {index}】")
@@ -388,9 +393,7 @@ def main():
             lines.append("")
     text = "\n".join(lines)
 
-    # Telegram Bot API 用纯文本发送，WeCom 使用同一份纯文本模板。
-    send_telegram(text)
-    send_wecom(text)
+    send_notification(text)
     sys.exit(0 if ok == len(accounts) else 1)
 
 if __name__ == "__main__":
