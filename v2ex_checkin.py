@@ -116,8 +116,8 @@ def send_wecom(plain_text):
     title = f"V2EX 每日签到 - {now_bj:%Y-%m-%d}"
     # mpnews 正文使用 HTML 换行，统一处理各平台的 LF、CRLF 和 CR 换行符。
     content = "<br/>".join(html.escape(line) for line in plain_text.splitlines())
-    # 摘要要求单行；split() 会将换行和连续空白统一为一个空格，避免摘要发生异常换行。
-    digest = " ".join(plain_text.split())[:100]
+    # 摘要保留换行，并限制在 300 个字符内。
+    digest = "\n".join(line.strip() for line in plain_text.splitlines() if line.strip())[:300]
 
     for index, app in enumerate(apps, start=1):
         if not isinstance(app, dict):
