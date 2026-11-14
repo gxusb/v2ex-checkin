@@ -227,7 +227,6 @@ def _reward_from_ledger_row(row, date_patterns):
         return ""
     if "每日登录奖励" not in text:
         return ""
-    # 账单的描述与变动金额在同一行；兼容 +5铜币、5 铜币等显示方式。
     match = re.search(r"([+-]?\s*\d+)\s*(铜币|银币|金币)", text)
     if not match:
         match = re.search(r"(铜币|银币|金币)\s*([+-]?\s*\d+)", text)
@@ -250,14 +249,12 @@ def _fetch_today_reward(session):
             re.escape(today.strftime("%Y-%m-%d")),
             re.escape(today.strftime("%Y/%m/%d")),
         ]
-        # 常见账单按表格行展示。逐行匹配日期和奖励描述，避免全页贪婪匹配到余额数字。
         rows = re.findall(r"(?is)<tr\b[^>]*>.*?</tr>", response.text)
         for row in rows:
             reward = _reward_from_ledger_row(row, date_patterns)
             if reward:
                 return reward
 
-        # 兼容非表格布局：标签去除后，日期和描述可能由 HTML 标签隔开。
         text = _plain_text(response.text)
         for match in re.finditer("每日登录奖励", text):
             start = max(0, match.start() - 100)
@@ -432,7 +429,8 @@ def main():
         reward = _reward_text(result["reward"]) if result["success"] else ""
         if result["success"]:
             reward_suffix = f"，获得 {reward[1:]}" if reward else ""
-            lines.append(f"📊 签到状态: {result['status']} ({ok}/{len(accounts)}){reward_suffix}")
+            count_suffix = "" if "今日已签过" in result["status"] else f" ({ok}/{len(accounts)})"
+            lines.append(f"📊 签到状态: {result['status']}{count_suffix}{reward_suffix}")
         else:
             lines.append(f"📊 签到状态: {result['status']} ({ok}/{len(accounts)})，{result['reward']}")
         if result["balance"]:
