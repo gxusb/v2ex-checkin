@@ -117,7 +117,9 @@ def send_wecom(plain_text):
 
     now_bj = datetime.now(timezone(timedelta(hours=8)))
     title = f"V2EX 每日签到 - {now_bj:%Y-%m-%d}"
+    # mpnews 正文使用 HTML 换行，统一处理各平台的 LF、CRLF 和 CR 换行符。
     content = "<br/>".join(html.escape(line) for line in plain_text.splitlines())
+    # 摘要保留换行，并限制在 300 个字符内。
     digest = "\n".join(line.strip() for line in plain_text.splitlines() if line.strip())[:300]
 
     for index, app in enumerate(apps, start=1):
@@ -199,46 +201,53 @@ def load_config():
     return accounts
 
 
-def _extract_reward(page):
-    """从签到页 HTML 提取奖励信息，返回 '获得 X 铜币' 或 ''"""
+def _plain_text(markup):
+    """将 HTML 转为可搜索文本，保留单元格/标签之间的分隔。"""
+    markup = re.sub(r"(?is)<(script|style)\b[^>]*>.*?</\1>", " ", markup or "")
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", markup))).strip()
+
+
+def _extract_amount(text):
+    """从文本片段提取币种金额，兼容“20 铜币”和“铜币 20”等格式。"""
     patterns = [
-        r'已成功领取每日登录奖励\s*(\d+)\s*(铜币|银币|金币)',
-        r'每日登录奖励\s*(\d+)\s*(铜币|银币|金币)',
-        r'领取[^<]*?(\d+)\s*(铜币|银币|金币)',
-        r'(\d+)\s*个?\s*(铜币|银币|金币)',
+        r"([+-]?\s*\d+)\s*(铜币|银币|金币)",
+        r"(铜币|银币|金币)\s*([+-]?\s*\d+)",
     ]
-    for pattern in patterns:
-        match = re.search(pattern, page)
+    for index, pattern in enumerate(patterns):
+        match = re.search(pattern, text)
         if match:
-            return f"获得 {match.group(1)} {match.group(2)}"
+            amount, unit = ((match.group(1), match.group(2)) if index == 0
+                            else (match.group(2), match.group(1)))
+            return f"获得 {amount.replace(' ', '').lstrip('+')} {unit}"
     return ""
 
 
-def _plain_text(markup):
-    """将 HTML 转为可搜索文本，保留单元格/标签之间的分隔。"""
-    markup = re.sub(r"(?is)<(script|style)\b[^>]*>.*?</\1>", " ", markup)
-    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", markup))).strip()
+def _extract_reward(page):
+    """从签到页 HTML 提取奖励信息，返回 '获得 X 铜币' 或 ''"""
+    text = _plain_text(page)
+    # 奖励数字可能被 HTML 标签包裹，先转纯文本，再围绕奖励描述取金额。
+    for keyword in ("每日登录奖励", "成功领取", "获得"):
+        for match in re.finditer(re.escape(keyword), text):
+            snippet = text[max(0, match.start() - 50):match.end() + 100]
+            reward = _extract_amount(snippet)
+            if reward:
+                return reward
+    return ""
 
 
 def _reward_from_ledger_row(row, date_patterns):
     """从同一条账单记录中取奖励，避免误把其他日期或余额当作今日奖励。"""
     text = _plain_text(row)
-    if not any(re.search(pattern, text) for pattern in date_patterns):
-        return ""
     if "每日登录奖励" not in text:
         return ""
-    match = re.search(r"([+-]?\s*\d+)\s*(铜币|银币|金币)", text)
-    if not match:
-        match = re.search(r"(铜币|银币|金币)\s*([+-]?\s*\d+)", text)
-        if match:
-            return f"获得 {match.group(2).replace(' ', '').lstrip('+')} {match.group(1)}"
-    if match:
-        return f"获得 {match.group(1).replace(' ', '').lstrip('+')} {match.group(2)}"
+    # 首选同一账单行中明确标注为今天的记录。
+    if any(re.search(pattern, text) for pattern in date_patterns):
+        return _extract_amount(text)
     return ""
 
 
 def _fetch_today_reward(session):
-    """已签过的账号从 /balance 今日账单提取奖励，失败时返回空字符串。"""
+    """已签过的账号从 /balance 今日账单提取奖励，失败时返回奖励描述或空字符串。"""
     try:
         response = session.get(f"{BASE_URL}/balance", timeout=TIMEOUT, allow_redirects=True)
         if response.status_code != 200:
@@ -248,26 +257,35 @@ def _fetch_today_reward(session):
             re.escape(today.strftime("%Y%m%d")),
             re.escape(today.strftime("%Y-%m-%d")),
             re.escape(today.strftime("%Y/%m/%d")),
+            rf"{today.year}\s*年\s*0?{today.month}\s*月\s*0?{today.day}\s*日?",
+            rf"0?{today.month}\s*月\s*0?{today.day}\s*日",
         ]
+        # 常见账单按表格行展示。逐行匹配日期和奖励描述，避免全页贪婪匹配到余额数字。
         rows = re.findall(r"(?is)<tr\b[^>]*>.*?</tr>", response.text)
         for row in rows:
             reward = _reward_from_ledger_row(row, date_patterns)
             if reward:
                 return reward
 
+        # 兼容非表格布局：标签去除后，日期和描述可能由 HTML 标签隔开。
         text = _plain_text(response.text)
         for match in re.finditer("每日登录奖励", text):
-            start = max(0, match.start() - 100)
-            end = min(len(text), match.end() + 100)
+            start = max(0, match.start() - 120)
+            end = min(len(text), match.end() + 120)
             snippet = text[start:end]
-            if not any(re.search(pattern, snippet) for pattern in date_patterns):
-                continue
-            amount = re.search(r"([+-]?\s*\d+)\s*(铜币|银币|金币)", snippet)
-            if amount:
-                return f"获得 {amount.group(1).replace(' ', '').lstrip('+')} {amount.group(2)}"
-            amount = re.search(r"(铜币|银币|金币)\s*([+-]?\s*\d+)", snippet)
-            if amount:
-                return f"获得 {amount.group(2).replace(' ', '').lstrip('+')} {amount.group(1)}"
+            if any(re.search(pattern, snippet) for pattern in date_patterns):
+                reward = _extract_amount(snippet)
+                if reward:
+                    return reward
+
+        # 有些账单不显示日期，或日期与记录分开展示。/balance 通常按时间倒序，
+        # 仅从“每日登录奖励”所在记录附近提取，避免误读账户总余额作为奖励。
+        for match in re.finditer("每日登录奖励", text):
+            start = max(0, match.start() - 60)
+            end = min(len(text), match.end() + 120)
+            reward = _extract_amount(text[start:end])
+            if reward:
+                return reward
         return ""
     except requests.RequestException:
         return ""
@@ -337,7 +355,7 @@ def checkin(name, cookie):
 
     balance = _extract_balance(response.text)
     days = _extract_days(response.text)
-    if "每日登录奖励已领取" in response.text:
+    if "每日登录奖励已领取" in _plain_text(response.text):
         reward = _extract_reward(response.text) or _fetch_today_reward(session)
         msg = f"今日已签过（{reward}）" if reward else "今日已签过"
         log(name, f"OK {msg}" + (f"，{days}" if days else "") + (f"，余额 {_bal_text(balance)}" if balance else ""))
