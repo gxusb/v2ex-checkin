@@ -441,8 +441,9 @@ def main():
                 for unit, short in (("金币", "金"), ("银币", "银"), ("铜币", "铜")))
             lines.append("📦 账户资产：")
             if reward:
-                lines.append(f"   今日奖励：{reward}")
-            lines.append(f"   总计 {copper} 铜币 ({asset_detail})")
+                lines.append(f"   铜币：[{reward}] 总计 {copper} ({asset_detail})")
+            else:
+                lines.append(f"   总计 {copper} 铜币 ({asset_detail})")
         if result["days"]:
             lines.append(f"   连续：{result['days']}")
         lines.append(f"🕐 完成时间: {now_bj:%Y-%m-%d %H:%M:%S}")
