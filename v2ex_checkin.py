@@ -75,8 +75,10 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 # V2EX 官方换算：1 金币 = 100 银币 = 10000 铜币（https://www.v2ex.com/help/currency）
 COPPER_RATE = {"金币": 10000, "银币": 100, "铜币": 1}
 
+
 def log(name, msg):
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] [{name}] {msg}", flush=True)
+
 
 def send_telegram(text):
     """通过 Telegram Bot 推送通知，需配置 TG_BOT_TOKEN 和 TG_CHAT_ID 环境变量"""
@@ -97,6 +99,7 @@ def send_telegram(text):
     except Exception as e:
         log("TG", f"通知发送异常: {e}")
 
+
 def send_wecom(plain_text):
     """以纯文本内容排版后，作为企业微信图文卡片发送。"""
     raw_apps = os.getenv("WECOM_APPS", "").strip()
@@ -114,9 +117,7 @@ def send_wecom(plain_text):
 
     now_bj = datetime.now(timezone(timedelta(hours=8)))
     title = f"V2EX 每日签到 - {now_bj:%Y-%m-%d}"
-    # mpnews 正文使用 HTML 换行，统一处理各平台的 LF、CRLF 和 CR 换行符。
     content = "<br/>".join(html.escape(line) for line in plain_text.splitlines())
-    # 摘要保留换行，并限制在 300 个字符内。
     digest = "\n".join(line.strip() for line in plain_text.splitlines() if line.strip())[:300]
 
     for index, app in enumerate(apps, start=1):
@@ -166,19 +167,15 @@ def send_wecom(plain_text):
         except (requests.RequestException, ValueError) as e:
             log("企业微信", f"应用 {index} 通知发送异常: {e}")
 
+
 def send_notification(text):
     """统一通知入口：依次调用已配置的通知渠道，未配置的渠道自动跳过。"""
     send_telegram(text)
     send_wecom(text)
 
-def load_config():
-    """加载账号配置，返回 [(name, cookie), ...]
 
-    优先级（高→低，可叠加）：
-      1. V2EX_ACCOUNTS 环境变量（JSON 数组，多账号）
-      2. V2EX_COOKIE 环境变量（单账号）
-      3. config.json 文件
-    """
+def load_config():
+    """加载账号配置，返回 [(name, cookie), ...]"""
     accounts = []
     env_accounts = os.getenv("V2EX_ACCOUNTS", "").strip()
     if env_accounts:
@@ -201,7 +198,8 @@ def load_config():
             accounts.append((cfg.get("name", "account"), cfg["cookie"]))
     return accounts
 
-def _extract_reward(html):
+
+def _extract_reward(page):
     """从签到页 HTML 提取奖励信息，返回 '获得 X 铜币' 或 ''"""
     patterns = [
         r'已成功领取每日登录奖励\s*(\d+)\s*(铜币|银币|金币)',
@@ -209,126 +207,186 @@ def _extract_reward(html):
         r'领取[^<]*?(\d+)\s*(铜币|银币|金币)',
         r'(\d+)\s*个?\s*(铜币|银币|金币)',
     ]
-    for p in patterns:
-        m = re.search(p, html)
-        if m:
-            return f"获得 {m.group(1)} {m.group(2)}"
+    for pattern in patterns:
+        match = re.search(pattern, page)
+        if match:
+            return f"获得 {match.group(1)} {match.group(2)}"
     return ""
 
+
+def _plain_text(markup):
+    """将 HTML 转为可搜索文本，保留单元格/标签之间的分隔。"""
+    markup = re.sub(r"(?is)<(script|style)\b[^>]*>.*?</\1>", " ", markup)
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", markup))).strip()
+
+
+def _reward_from_ledger_row(row, date_patterns):
+    """从同一条账单记录中取奖励，避免误把其他日期或余额当作今日奖励。"""
+    text = _plain_text(row)
+    if not any(re.search(pattern, text) for pattern in date_patterns):
+        return ""
+    if "每日登录奖励" not in text:
+        return ""
+    # 账单的描述与变动金额在同一行；兼容 +5铜币、5 铜币等显示方式。
+    match = re.search(r"([+-]?\s*\d+)\s*(铜币|银币|金币)", text)
+    if not match:
+        match = re.search(r"(铜币|银币|金币)\s*([+-]?\s*\d+)", text)
+        if match:
+            return f"获得 {match.group(2).replace(' ', '').lstrip('+')} {match.group(1)}"
+    if match:
+        return f"获得 {match.group(1).replace(' ', '').lstrip('+')} {match.group(2)}"
+    return ""
+
+
 def _fetch_today_reward(session):
-    """已签过的账号从 /balance 账单提取今日奖励，返回奖励描述或空字符串。"""
+    """已签过的账号从 /balance 今日账单提取奖励，失败时返回空字符串。"""
     try:
-        r = session.get(f"{BASE_URL}/balance", timeout=TIMEOUT, allow_redirects=True)
-        if r.status_code != 200:
+        response = session.get(f"{BASE_URL}/balance", timeout=TIMEOUT, allow_redirects=True)
+        if response.status_code != 200:
             return ""
-        today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d")
-        m = re.search(today + r'\s*的每日登录奖励[^<]*?(\d+)\s*(铜币|银币|金币)', r.text)
-        return f"获得 {m.group(1)} {m.group(2)}" if m else ""
+        today = datetime.now(timezone(timedelta(hours=8)))
+        date_patterns = [
+            re.escape(today.strftime("%Y%m%d")),
+            re.escape(today.strftime("%Y-%m-%d")),
+            re.escape(today.strftime("%Y/%m/%d")),
+        ]
+        # 常见账单按表格行展示。逐行匹配日期和奖励描述，避免全页贪婪匹配到余额数字。
+        rows = re.findall(r"(?is)<tr\b[^>]*>.*?</tr>", response.text)
+        for row in rows:
+            reward = _reward_from_ledger_row(row, date_patterns)
+            if reward:
+                return reward
+
+        # 兼容非表格布局：标签去除后，日期和描述可能由 HTML 标签隔开。
+        text = _plain_text(response.text)
+        for match in re.finditer("每日登录奖励", text):
+            start = max(0, match.start() - 100)
+            end = min(len(text), match.end() + 100)
+            snippet = text[start:end]
+            if not any(re.search(pattern, snippet) for pattern in date_patterns):
+                continue
+            amount = re.search(r"([+-]?\s*\d+)\s*(铜币|银币|金币)", snippet)
+            if amount:
+                return f"获得 {amount.group(1).replace(' ', '').lstrip('+')} {amount.group(2)}"
+            amount = re.search(r"(铜币|银币|金币)\s*([+-]?\s*\d+)", snippet)
+            if amount:
+                return f"获得 {amount.group(2).replace(' ', '').lstrip('+')} {amount.group(1)}"
+        return ""
     except requests.RequestException:
         return ""
 
-def _extract_days(html):
-    m = re.search(r'已连续登录\s*(\d+)\s*天', html)
-    return f"已连续登录 {m.group(1)} 天" if m else ""
 
-def _extract_balance(html):
-    m = re.search(r'class="balance_area"[^>]*>(.*?)</(?:a|div)>', html, re.S)
-    if not m:
+def _extract_days(page):
+    match = re.search(r"已连续登录\s*(\d+)\s*天", page)
+    return f"已连续登录 {match.group(1)} 天" if match else ""
+
+
+def _extract_balance(page):
+    match = re.search(r'class="balance_area"[^>]*>(.*?)</(?:a|div)>', page, re.S)
+    if not match:
         return None
-    area = m.group(1)
+    area = match.group(1)
     units = (("gold", "金币"), ("silver", "银币"), ("bronze", "铜币"))
-    res = {}
+    result = {}
     for icon, unit in units:
-        mm = re.search(r'(\d+)\s*<img[^>]*' + icon, area)
-        if mm:
-            res[unit] = int(mm.group(1))
-    if len(res) == 3:
-        return res
-    nums = re.findall(r'\d+', re.sub(r'<[^>]+>', ' ', area))
-    if len(nums) >= 3:
-        return {unit: int(n) for (_, unit), n in zip(units, nums[:3])}
+        found = re.search(r"(\d+)\s*<img[^>]*" + icon, area)
+        if found:
+            result[unit] = int(found.group(1))
+    if len(result) == 3:
+        return result
+    numbers = re.findall(r"\d+", re.sub(r"<[^>]+>", " ", area))
+    if len(numbers) >= 3:
+        return {unit: int(number) for (_, unit), number in zip(units, numbers[:3])}
     return None
 
+
 def _fmt_balance(balance):
-    return "".join(f"{balance[u]}{u[0]}" for u in ("金币", "银币", "铜币")
-                   if u in balance and (balance[u] or u == "铜币"))
+    return "".join(f"{balance[unit]}{unit[0]}" for unit in ("金币", "银币", "铜币")
+                   if unit in balance and (balance[unit] or unit == "铜币"))
+
 
 def _to_copper(balance):
-    return sum(balance.get(u, 0) * r for u, r in COPPER_RATE.items())
+    return sum(balance.get(unit, 0) * rate for unit, rate in COPPER_RATE.items())
 
-def _norm_copper(c):
-    return {"金币": c // 10000, "银币": c % 10000 // 100, "铜币": c % 100}
+
+def _norm_copper(copper):
+    return {"金币": copper // 10000, "银币": copper % 10000 // 100, "铜币": copper % 100}
+
 
 def _bal_text(balance):
-    c = _to_copper(balance)
+    copper = _to_copper(balance)
     if balance.get("金币") or balance.get("银币"):
-        return f"{c}铜（{_fmt_balance(balance)}）"
-    return f"{c}铜"
+        return f"{copper}铜（{_fmt_balance(balance)}）"
+    return f"{copper}铜"
+
 
 def _reward_text(reward):
-    m = re.search(r'(\d+)\s*(铜币|银币|金币)', reward or "")
-    return f"+{m.group(1)} {m.group(2)}" if m else "未识别"
+    match = re.search(r"(\d+)\s*(铜币|银币|金币)", reward or "")
+    return f"+{match.group(1)} {match.group(2)}" if match else ""
+
 
 def checkin(name, cookie):
     """签到，返回 (success, reward, balance, days)"""
-    s = requests.Session()
-    s.headers.update({
+    session = requests.Session()
+    session.headers.update({
         "User-Agent": UA, "Cookie": cookie,
         "Referer": f"{BASE_URL}/mission/daily",
         "Accept-Language": "zh-CN,zh;q=0.9",
     })
-    r = s.get(f"{BASE_URL}/mission/daily", timeout=TIMEOUT, allow_redirects=True)
-    if "/signin" in r.url or "You need to sign in" in r.text or "请先登录" in r.text:
+    response = session.get(f"{BASE_URL}/mission/daily", timeout=TIMEOUT, allow_redirects=True)
+    if "/signin" in response.url or "You need to sign in" in response.text or "请先登录" in response.text:
         log(name, "X 未登录或 Cookie 已失效")
         return False, "未登录或 Cookie 已失效", None, ""
 
-    balance = _extract_balance(r.text)
-    days = _extract_days(r.text)
-    if "每日登录奖励已领取" in r.text:
-        reward = _extract_reward(r.text) or _fetch_today_reward(s)
+    balance = _extract_balance(response.text)
+    days = _extract_days(response.text)
+    if "每日登录奖励已领取" in response.text:
+        reward = _extract_reward(response.text) or _fetch_today_reward(session)
         msg = f"今日已签过（{reward}）" if reward else "今日已签过"
         log(name, f"OK {msg}" + (f"，{days}" if days else "") + (f"，余额 {_bal_text(balance)}" if balance else ""))
         return True, msg, balance, days
 
-    m = re.search(r'/mission/daily/redeem\?once=(\d+)', r.text)
-    if not m:
-        m = re.search(r'once=(\d+)', r.text)
-    if not m:
+    match = re.search(r"/mission/daily/redeem\?once=(\d+)", response.text)
+    if not match:
+        match = re.search(r"once=(\d+)", response.text)
+    if not match:
         log(name, "X 未找到签到 token，页面结构可能已变化")
         return False, "未找到签到 token", None, ""
 
-    r2 = s.get(f"{BASE_URL}/mission/daily/redeem?once={m.group(1)}", timeout=TIMEOUT, allow_redirects=True)
-    if r2.status_code != 200:
-        log(name, f"X 签到失败 HTTP {r2.status_code}")
-        return False, f"签到失败 HTTP {r2.status_code}", None, ""
+    redeem_response = session.get(
+        f"{BASE_URL}/mission/daily/redeem?once={match.group(1)}", timeout=TIMEOUT, allow_redirects=True)
+    if redeem_response.status_code != 200:
+        log(name, f"X 签到失败 HTTP {redeem_response.status_code}")
+        return False, f"签到失败 HTTP {redeem_response.status_code}", None, ""
 
     time.sleep(1)
-    r3 = s.get(f"{BASE_URL}/mission/daily", timeout=TIMEOUT, allow_redirects=True)
-    pages = [r3.text if r3.status_code == 200 else "", r2.text]
-    balance = _extract_balance(pages[0]) or _extract_balance(r2.text) or balance
-    days = _extract_days(pages[0]) or _extract_days(r2.text) or days
+    page_response = session.get(f"{BASE_URL}/mission/daily", timeout=TIMEOUT, allow_redirects=True)
+    pages = [page_response.text if page_response.status_code == 200 else "", redeem_response.text]
+    balance = _extract_balance(pages[0]) or _extract_balance(redeem_response.text) or balance
+    days = _extract_days(pages[0]) or _extract_days(redeem_response.text) or days
     for page in pages:
         reward = _extract_reward(page)
         if reward:
             log(name, f"OK 签到成功（{reward}）" + (f"，{days}" if days else "") + (f"，余额 {_bal_text(balance)}" if balance else ""))
             return True, reward, balance, days
-    reward = _fetch_today_reward(s)
+    reward = _fetch_today_reward(session)
     if reward:
         log(name, f"OK 签到成功（{reward}）" + (f"，{days}" if days else "") + (f"，余额 {_bal_text(balance)}" if balance else ""))
         return True, reward, balance, days
 
     for page in pages:
-        for kw in ["铜币", "银币", "金币", "领取", "奖励"]:
-            idx = page.find(kw)
-            if idx >= 0:
-                snippet = page[max(0, idx - 40):idx + 60].strip()
-                log(name, f"诊断 [{kw}] 片段: ...{snippet}...")
+        for keyword in ["铜币", "银币", "金币", "领取", "奖励"]:
+            index = page.find(keyword)
+            if index >= 0:
+                snippet = page[max(0, index - 40):index + 60].strip()
+                log(name, f"诊断 [{keyword}] 片段: ...{snippet}...")
                 break
         else:
             continue
         break
     log(name, "OK 签到成功" + (f"，{days}" if days else "") + (f"，余额 {_bal_text(balance)}" if balance else ""))
     return True, "签到成功（奖励信息未识别）", balance, days
+
 
 def main():
     accounts = load_config()
@@ -347,11 +405,11 @@ def main():
             success, reward, balance, days = checkin(name, cookie)
             if success:
                 ok += 1
-                status = f"✅ 今日已签过" if "今日已签过" in reward else "✅ 签到成功"
+                status = "✅ 今日已签过" if "今日已签过" in reward else "✅ 签到成功"
                 account_results.append({"name": name, "success": True, "status": status,
                                         "reward": reward, "balance": balance, "days": days})
-                for amt, unit in re.findall(r'(\d+)\s*(铜币|银币|金币)', reward):
-                    coins[unit] = coins.get(unit, 0) + int(amt)
+                for amount, unit in re.findall(r"(\d+)\s*(铜币|银币|金币)", reward):
+                    coins[unit] = coins.get(unit, 0) + int(amount)
                 if balance:
                     for unit, value in balance.items():
                         total_bal[unit] = total_bal.get(unit, 0) + value
@@ -367,25 +425,26 @@ def main():
 
     log("系统", f"完成：{ok}/{len(accounts)} 成功")
     now_bj = datetime.now(timezone(timedelta(hours=8)))
-    total_reward = "，".join(f"{value} {unit}" for unit, value in coins.items()) if coins else "无"
-    total_balance = _norm_copper(_to_copper(total_bal)) if bal_count and len(accounts) > 1 else None
-
-    # 统一纯文本模板，通知渠道共用。
     lines = []
     for index, result in enumerate(account_results, start=1):
         lines.append(f"【账号 {index}】")
         lines.append(f"👤 账号信息: {result['name']}")
-        reward = _reward_text(result["reward"]) if result["success"] else result["reward"]
+        reward = _reward_text(result["reward"]) if result["success"] else ""
         if result["success"]:
-            lines.append(f"📊 签到状态: {result['status']} ({ok}/{len(accounts)})，获得 {reward.replace('+', '')}")
+            reward_suffix = f"，获得 {reward[1:]}" if reward else ""
+            lines.append(f"📊 签到状态: {result['status']} ({ok}/{len(accounts)}){reward_suffix}")
         else:
             lines.append(f"📊 签到状态: {result['status']} ({ok}/{len(accounts)})，{result['reward']}")
         if result["balance"]:
             balance = result["balance"]
             copper = _to_copper(balance)
-            asset_detail = " ".join(f"{balance.get(unit, 0)}{short}" for unit, short in (("金币", "金"), ("银币", "银"), ("铜币", "铜")))
-            lines.append(f"📦 账户资产：")
-            lines.append(f"   铜币：[{reward}] 总计 {copper} ({asset_detail})")
+            asset_detail = " ".join(
+                f"{balance.get(unit, 0)}{short}"
+                for unit, short in (("金币", "金"), ("银币", "银"), ("铜币", "铜")))
+            lines.append("📦 账户资产：")
+            if reward:
+                lines.append(f"   今日奖励：{reward}")
+            lines.append(f"   总计 {copper} 铜币 ({asset_detail})")
         if result["days"]:
             lines.append(f"   连续：{result['days']}")
         lines.append(f"🕐 完成时间: {now_bj:%Y-%m-%d %H:%M:%S}")
@@ -395,6 +454,7 @@ def main():
 
     send_notification(text)
     sys.exit(0 if ok == len(accounts) else 1)
+
 
 if __name__ == "__main__":
     main()
