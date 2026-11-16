@@ -232,6 +232,16 @@ def _extract_reward(page):
     return ""
 
 
+def _reward_from_ledger_row(row, date_patterns):
+    """从同一条账单记录中取奖励，避免误把其他日期或余额当作今日奖励。"""
+    text = _plain_text(row)
+    if "每日登录奖励" not in text:
+        return ""
+    if any(re.search(pattern, text) for pattern in date_patterns):
+        return _extract_amount(text)
+    return ""
+
+
 def _fetch_today_reward(session):
     """已签过的账号从 /balance 今日账单提取奖励，失败时返回奖励描述或空字符串。"""
     try:
@@ -248,11 +258,9 @@ def _fetch_today_reward(session):
         ]
         rows = re.findall(r"(?is)<tr\b[^>]*>.*?</tr>", response.text)
         for row in rows:
-            text = _plain_text(row)
-            if "每日登录奖励" in text and any(re.search(p, text) for p in date_patterns):
-                reward = _extract_amount(text)
-                if reward:
-                    return reward
+            reward = _reward_from_ledger_row(row, date_patterns)
+            if reward:
+                return reward
 
         text = _plain_text(response.text)
         for match in re.finditer("每日登录奖励", text):
@@ -350,7 +358,6 @@ def checkin(name, cookie):
         log(name, f"OK {msg}" + (f"，{days}" if days else "") + (f"，余额 {_bal_text(balance)}" if balance else ""))
         return True, msg, balance, days
 
-    # HTML 中链接参数可能带有实体编码，先解码后再提取 once token。
     checkin_html = html.unescape(response.text)
     match = re.search(r"/mission/daily/redeem\?once=(\d+)", checkin_html)
     if not match:
@@ -364,6 +371,7 @@ def checkin(name, cookie):
     if redeem_response.status_code != 200:
         log(name, f"X 签到失败 HTTP {redeem_response.status_code}")
         return False, f"签到失败 HTTP {redeem_response.status_code}", None, ""
+
     if _is_login_page(redeem_response):
         log(name, "X 签到请求跳转到登录页，Cookie 可能已失效")
         return False, "未登录或 Cookie 已失效", None, ""
@@ -373,6 +381,7 @@ def checkin(name, cookie):
     if _is_login_page(page_response):
         log(name, "X 签到后验证失败：Cookie 已失效或登录状态丢失")
         return False, "未登录或 Cookie 已失效", None, ""
+
     pages = [page_response.text if page_response.status_code == 200 else "", redeem_response.text]
     balance = _extract_balance(pages[0]) or _extract_balance(redeem_response.text) or balance
     days = _extract_days(pages[0]) or _extract_days(redeem_response.text) or days
@@ -382,7 +391,6 @@ def checkin(name, cookie):
             log(name, f"OK 签到成功（{reward}）" + (f"，{days}" if days else "") + (f"，余额 {_bal_text(balance)}" if balance else ""))
             return True, reward, balance, days
 
-    # 有些版本的成功提示只显示“已领取”，没有附带奖励金额。
     if "每日登录奖励已领取" in _plain_text(page_response.text):
         reward = _fetch_today_reward(session)
         msg = f"今日已签过（{reward}）" if reward else "今日已签过"
