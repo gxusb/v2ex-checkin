@@ -117,9 +117,7 @@ def send_wecom(plain_text):
 
     now_bj = datetime.now(timezone(timedelta(hours=8)))
     title = f"V2EX 每日签到 - {now_bj:%Y-%m-%d}"
-    # mpnews 正文使用 HTML 换行，统一处理各平台的 LF、CRLF 和 CR 换行符。
     content = "<br/>".join(html.escape(line) for line in plain_text.splitlines())
-    # 摘要保留换行，并限制在 300 个字符内。
     digest = "\n".join(line.strip() for line in plain_text.splitlines() if line.strip())[:300]
 
     for index, app in enumerate(apps, start=1):
@@ -225,24 +223,12 @@ def _extract_amount(text):
 def _extract_reward(page):
     """从签到页 HTML 提取奖励信息，返回 '获得 X 铜币' 或 ''"""
     text = _plain_text(page)
-    # 奖励数字可能被 HTML 标签包裹，先转纯文本，再围绕奖励描述取金额。
     for keyword in ("每日登录奖励", "成功领取", "获得"):
         for match in re.finditer(re.escape(keyword), text):
             snippet = text[max(0, match.start() - 50):match.end() + 100]
             reward = _extract_amount(snippet)
             if reward:
                 return reward
-    return ""
-
-
-def _reward_from_ledger_row(row, date_patterns):
-    """从同一条账单记录中取奖励，避免误把其他日期或余额当作今日奖励。"""
-    text = _plain_text(row)
-    if "每日登录奖励" not in text:
-        return ""
-    # 首选同一账单行中明确标注为今天的记录。
-    if any(re.search(pattern, text) for pattern in date_patterns):
-        return _extract_amount(text)
     return ""
 
 
@@ -260,14 +246,14 @@ def _fetch_today_reward(session):
             rf"{today.year}\s*年\s*0?{today.month}\s*月\s*0?{today.day}\s*日?",
             rf"0?{today.month}\s*月\s*0?{today.day}\s*日",
         ]
-        # 常见账单按表格行展示。逐行匹配日期和奖励描述，避免全页贪婪匹配到余额数字。
         rows = re.findall(r"(?is)<tr\b[^>]*>.*?</tr>", response.text)
         for row in rows:
-            reward = _reward_from_ledger_row(row, date_patterns)
-            if reward:
-                return reward
+            text = _plain_text(row)
+            if "每日登录奖励" in text and any(re.search(p, text) for p in date_patterns):
+                reward = _extract_amount(text)
+                if reward:
+                    return reward
 
-        # 兼容非表格布局：标签去除后，日期和描述可能由 HTML 标签隔开。
         text = _plain_text(response.text)
         for match in re.finditer("每日登录奖励", text):
             start = max(0, match.start() - 120)
@@ -277,9 +263,6 @@ def _fetch_today_reward(session):
                 reward = _extract_amount(snippet)
                 if reward:
                     return reward
-
-        # 有些账单不显示日期，或日期与记录分开展示。/balance 通常按时间倒序，
-        # 仅从“每日登录奖励”所在记录附近提取，避免误读账户总余额作为奖励。
         for match in re.finditer("每日登录奖励", text):
             start = max(0, match.start() - 60)
             end = min(len(text), match.end() + 120)
@@ -340,6 +323,12 @@ def _reward_text(reward):
     return f"+{match.group(1)} {match.group(2)}" if match else ""
 
 
+def _is_login_page(response):
+    """识别签到请求被重定向到登录页或返回登录提示的情况。"""
+    return ("/signin" in response.url or "You need to sign in" in response.text
+            or "请先登录" in _plain_text(response.text))
+
+
 def checkin(name, cookie):
     """签到，返回 (success, reward, balance, days)"""
     session = requests.Session()
@@ -349,7 +338,7 @@ def checkin(name, cookie):
         "Accept-Language": "zh-CN,zh;q=0.9",
     })
     response = session.get(f"{BASE_URL}/mission/daily", timeout=TIMEOUT, allow_redirects=True)
-    if "/signin" in response.url or "You need to sign in" in response.text or "请先登录" in response.text:
+    if _is_login_page(response):
         log(name, "X 未登录或 Cookie 已失效")
         return False, "未登录或 Cookie 已失效", None, ""
 
@@ -361,9 +350,11 @@ def checkin(name, cookie):
         log(name, f"OK {msg}" + (f"，{days}" if days else "") + (f"，余额 {_bal_text(balance)}" if balance else ""))
         return True, msg, balance, days
 
-    match = re.search(r"/mission/daily/redeem\?once=(\d+)", response.text)
+    # HTML 中链接参数可能带有实体编码，先解码后再提取 once token。
+    checkin_html = html.unescape(response.text)
+    match = re.search(r"/mission/daily/redeem\?once=(\d+)", checkin_html)
     if not match:
-        match = re.search(r"once=(\d+)", response.text)
+        match = re.search(r"[?&]once=(\d+)", checkin_html)
     if not match:
         log(name, "X 未找到签到 token，页面结构可能已变化")
         return False, "未找到签到 token", None, ""
@@ -373,9 +364,15 @@ def checkin(name, cookie):
     if redeem_response.status_code != 200:
         log(name, f"X 签到失败 HTTP {redeem_response.status_code}")
         return False, f"签到失败 HTTP {redeem_response.status_code}", None, ""
+    if _is_login_page(redeem_response):
+        log(name, "X 签到请求跳转到登录页，Cookie 可能已失效")
+        return False, "未登录或 Cookie 已失效", None, ""
 
     time.sleep(1)
     page_response = session.get(f"{BASE_URL}/mission/daily", timeout=TIMEOUT, allow_redirects=True)
+    if _is_login_page(page_response):
+        log(name, "X 签到后验证失败：Cookie 已失效或登录状态丢失")
+        return False, "未登录或 Cookie 已失效", None, ""
     pages = [page_response.text if page_response.status_code == 200 else "", redeem_response.text]
     balance = _extract_balance(pages[0]) or _extract_balance(redeem_response.text) or balance
     days = _extract_days(pages[0]) or _extract_days(redeem_response.text) or days
@@ -384,6 +381,14 @@ def checkin(name, cookie):
         if reward:
             log(name, f"OK 签到成功（{reward}）" + (f"，{days}" if days else "") + (f"，余额 {_bal_text(balance)}" if balance else ""))
             return True, reward, balance, days
+
+    # 有些版本的成功提示只显示“已领取”，没有附带奖励金额。
+    if "每日登录奖励已领取" in _plain_text(page_response.text):
+        reward = _fetch_today_reward(session)
+        msg = f"今日已签过（{reward}）" if reward else "今日已签过"
+        log(name, f"OK {msg}" + (f"，{days}" if days else "") + (f"，余额 {_bal_text(balance)}" if balance else ""))
+        return True, msg, balance, days
+
     reward = _fetch_today_reward(session)
     if reward:
         log(name, f"OK 签到成功（{reward}）" + (f"，{days}" if days else "") + (f"，余额 {_bal_text(balance)}" if balance else ""))
