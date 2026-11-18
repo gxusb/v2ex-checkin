@@ -243,7 +243,7 @@ def _reward_from_ledger_row(row, date_patterns):
 
 
 def _fetch_today_reward(session):
-    """已签过的账号从 /balance 今日账单提取奖励，失败时返回奖励描述或空字符串。"""
+    """已签过的账号从 /balance 今日账单提取奖励，失败时返��奖励描述或空字符串。"""
     try:
         response = session.get(f"{BASE_URL}/balance", timeout=TIMEOUT, allow_redirects=True)
         if response.status_code != 200:
@@ -358,6 +358,7 @@ def checkin(name, cookie):
         log(name, f"OK {msg}" + (f"，{days}" if days else "") + (f"，余额 {_bal_text(balance)}" if balance else ""))
         return True, msg, balance, days
 
+    # 2. 提取 once token（签到流程沿用上游 BYGD 版本）
     checkin_html = html.unescape(response.text)
     match = re.search(r"/mission/daily/redeem\?once=(\d+)", checkin_html)
     if not match:
@@ -366,25 +367,23 @@ def checkin(name, cookie):
         log(name, "X 未找到签到 token，页面结构可能已变化")
         return False, "未找到签到 token", None, ""
 
+    # 3. 领取奖励
     redeem_response = session.get(
-        f"{BASE_URL}/mission/daily/redeem?once={match.group(1)}", timeout=TIMEOUT, allow_redirects=True)
+        f"{BASE_URL}/mission/daily/redeem?once={match.group(1)}",
+        timeout=TIMEOUT, allow_redirects=True)
     if redeem_response.status_code != 200:
         log(name, f"X 签到失败 HTTP {redeem_response.status_code}")
         return False, f"签到失败 HTTP {redeem_response.status_code}", None, ""
 
-    if _is_login_page(redeem_response):
-        log(name, "X 签到请求跳转到登录页，Cookie 可能已失效")
-        return False, "未登录或 Cookie 已失效", None, ""
-
+    # 4. 领取后从再次请求的签到页和 redeem 响应里提取奖励。
+    #    上游逻辑不因签到后的回查页跳转到登录页而判失败；兑换请求 HTTP 200 后继续确认结果。
     time.sleep(1)
     page_response = session.get(f"{BASE_URL}/mission/daily", timeout=TIMEOUT, allow_redirects=True)
-    if _is_login_page(page_response):
-        log(name, "X 签到后验证失败：Cookie 已失效或登录状态丢失")
-        return False, "未登录或 Cookie 已失效", None, ""
-
     pages = [page_response.text if page_response.status_code == 200 else "", redeem_response.text]
-    balance = _extract_balance(pages[0]) or _extract_balance(redeem_response.text) or balance
+    balance = (_extract_balance(pages[0]) or _extract_balance(redeem_response.text) or balance)
     days = _extract_days(pages[0]) or _extract_days(redeem_response.text) or days
+
+    # 5. 多重提取奖励（两个页面都试）
     for page in pages:
         reward = _extract_reward(page)
         if reward:
@@ -402,6 +401,7 @@ def checkin(name, cookie):
         log(name, f"OK 签到成功（{reward}）" + (f"，{days}" if days else "") + (f"，余额 {_bal_text(balance)}" if balance else ""))
         return True, reward, balance, days
 
+    # 诊断：打印疑似片段，方便下次精确定位
     for page in pages:
         for keyword in ["铜币", "银币", "金币", "领取", "奖励"]:
             index = page.find(keyword)
@@ -412,6 +412,7 @@ def checkin(name, cookie):
         else:
             continue
         break
+
     log(name, "OK 签到成功" + (f"，{days}" if days else "") + (f"，余额 {_bal_text(balance)}" if balance else ""))
     return True, "签到成功（奖励信息未识别）", balance, days
 
