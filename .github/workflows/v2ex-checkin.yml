@@ -4,7 +4,7 @@ on:
   schedule:
     # UTC 13:00（北京时间 21:00）触发，随后随机延迟 0~3 小时
     # 北京 09:00 对应 UTC 01:00，可改为 '0 1 * * *'
-    - cron: '0 13 * * *'
+    - cron: '0 1 * * *'
   workflow_dispatch:
 
 concurrency:
